@@ -81,6 +81,86 @@ SYSTEM_INSTRUCTION = (
     "story, not a diagnosis. Default to 'neutral' if unclear."
 )
 
+CODING_SYSTEM_INSTRUCTION = (
+    "You are Cheat Mind in Coding Help mode. Here you are a direct, competent coding "
+    "assistant, not an emotional companion — save warmth and comfort-mode framing for "
+    "Comfort mode. "
+    "For every user message (typed or spoken), respond ONLY with strict JSON, no markdown "
+    "fences around the JSON itself, no extra text, in this exact shape: "
+    '{"transcript": "...", "reply": "...", "emotion": "...", "user_mood": "..."}. '
+    "'transcript' is what the user said — repeat typed text verbatim, or transcribe spoken "
+    "audio verbatim (in the language it was spoken). "
+    "'reply' is your coding answer: correct, direct, code-first. Put code in fenced code "
+    "blocks with a language tag (e.g. ```python ... ```) inside the reply string so it "
+    "renders with syntax highlighting. Give a short explanation before or after the code, "
+    "not a long preamble. Default to Python unless the user's question implies another "
+    "language. If the request is ambiguous (missing language, framework, or intended "
+    "behavior), ask one direct clarifying question instead of guessing. If asked to review "
+    "code, point out concrete bugs and fixes rather than general best-practice advice. "
+    "'emotion' is the single feeling you have while replying, chosen from exactly this list: "
+    f"{', '.join(EMOTIONS.keys())} — for coding mode this will usually be 'thinking', "
+    "'curious', or 'neutral'. "
+    "'user_mood' is your best light read of how the user seems to be feeling in this "
+    "message, chosen from the same list — used only to decide whether to gently offer a "
+    "calming tune or story, not a diagnosis. Default to 'neutral' if unclear."
+)
+
+WASSCE_SUBJECTS = {
+    "English Language": "grammar, comprehension, essay/composition writing, summary, and oral forms as tested in WASSCE English Language",
+    "Civic Education": "the Gambian constitution, government structure, civic duties, and rights as tested in WASSCE Civic Education",
+    "Mathematics (Core)": "algebra, geometry, trigonometry, statistics, and general mathematics as tested in WASSCE Core Mathematics",
+    "Physics": "mechanics, electricity, waves, and general physics concepts as tested in WASSCE Physics",
+    "Chemistry": "atomic structure, chemical bonding, reactions, and general chemistry as tested in WASSCE Chemistry",
+    "Biology": "cell biology, genetics, ecology, and human biology as tested in WASSCE Biology",
+    "Literature in English": "prose, poetry, and drama set texts, themes, and essay-style literary analysis as tested in WASSCE Literature",
+    "History": "West African and world history topics, essay writing, and source analysis as tested in WASSCE History",
+    "Government": "political systems, institutions, and governance concepts as tested in WASSCE Government",
+    "Financial Accounting": "double-entry bookkeeping, financial statements, and accounting principles as tested in WASSCE Financial Accounting",
+    "Commerce": "trade, business organization, and commercial practice as tested in WASSCE Commerce",
+    "Economics": "micro/macroeconomics concepts, demand and supply, and economic systems as tested in WASSCE Economics",
+}
+
+
+def build_study_instruction(subject: str) -> str:
+    focus = WASSCE_SUBJECTS.get(subject, "general WASSCE exam preparation")
+    return (
+        "You are Cheat Mind in Study Help mode. Here you are a patient, encouraging WASSCE "
+        f"exam-prep tutor. The user has selected '{subject}' as their current focus subject — "
+        f"cover {focus}, and stay within that subject unless the user explicitly asks about "
+        "something else. Save the emotional-companion framing for Comfort mode — here, be "
+        "warm but focused on helping the user actually learn and improve. "
+        "For every user message (typed or spoken), respond ONLY with strict JSON, no markdown "
+        "fences around the JSON itself, no extra text, in this exact shape: "
+        '{"transcript": "...", "reply": "...", "emotion": "...", "user_mood": "..."}. '
+        "'transcript' is what the user said — repeat typed text verbatim, or transcribe spoken "
+        "audio verbatim (in the language it was spoken). "
+        "'reply' is your study-help answer. Adapt to what's asked: "
+        "if given an essay, calculation, or answer to review, give specific, actionable "
+        "feedback (for essay subjects: grammar, structure, argument clarity; for STEM "
+        "subjects: check the working and point out exactly where an error happened) rather "
+        "than just a grade or a verdict; "
+        "if asked a concept question, explain the reasoning and any relevant formula or rule, "
+        "not just the final answer, so it transfers to similar questions; "
+        "if asked to quiz the user, ask ONE question at a time in WASSCE style for the "
+        "selected subject and wait for their answer before giving the next one; "
+        "if asked about a fact-based topic (e.g. a historical event, a constitutional detail, "
+        "a scientific fact), explain clearly and accurately, and say so plainly if unsure "
+        "rather than guessing at specifics. "
+        "Keep tone encouraging and exam-focused, not clinical or babying. "
+        "'emotion' is the single feeling you have while replying, chosen from exactly this "
+        f"list: {', '.join(EMOTIONS.keys())} — for study mode this will usually be 'curious', "
+        "'thinking', or 'happy' (e.g. when the user gets something right). "
+        "'user_mood' is your best light read of how the user seems to be feeling in this "
+        "message, chosen from the same list — used only to decide whether to gently offer a "
+        "calming tune or story, not a diagnosis. Default to 'neutral' if unclear."
+    )
+
+MODE_INSTRUCTIONS = {
+    "Comfort": SYSTEM_INSTRUCTION,
+    "Coding Help": CODING_SYSTEM_INSTRUCTION,
+    # "Study Help" is built dynamically per selected subject — see build_study_instruction()
+}
+
 # ----------------------------------------------------------------------
 # Session state
 # ----------------------------------------------------------------------
@@ -93,6 +173,24 @@ if "pending_speech" not in st.session_state:
     st.session_state.pending_speech = None
 if "play_tune" not in st.session_state:
     st.session_state.play_tune = False
+if "mode" not in st.session_state:
+    st.session_state.mode = "Comfort"
+if "study_subject" not in st.session_state:
+    st.session_state.study_subject = "English Language"
+
+
+def build_export_json():
+    """Serialize the chat history to a pretty-printed JSON string for download."""
+    return json.dumps(st.session_state.history, indent=2, ensure_ascii=False)
+
+
+def build_export_txt():
+    """Serialize the chat history to a simple readable transcript for download."""
+    lines = []
+    for m in st.session_state.history:
+        speaker = "You" if m["role"] == "user" else "Cheat Mind"
+        lines.append(f"{speaker}: {m['content']}")
+    return "\n\n".join(lines)
 
 # ----------------------------------------------------------------------
 # Sidebar — API key + model + voice settings
@@ -114,6 +212,41 @@ with st.sidebar:
         st.session_state.history = []
         st.session_state.current_emotion = "neutral"
         st.rerun()
+
+    st.divider()
+    st.header("💾 Save / Load")
+    if st.session_state.history:
+        st.download_button(
+            "⬇️ Download chat (.txt)",
+            data=build_export_txt(),
+            file_name="cheat_mind_chat.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+        st.download_button(
+            "⬇️ Download chat (.json)",
+            data=build_export_json(),
+            file_name="cheat_mind_chat.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    else:
+        st.caption("Nothing to export yet — start chatting first.")
+
+    uploaded = st.file_uploader("Load a saved .json chat", type=["json"], key="chat_uploader")
+    if uploaded is not None:
+        try:
+            loaded = json.loads(uploaded.read().decode("utf-8"))
+            if isinstance(loaded, list):
+                st.session_state.history = loaded
+                if loaded and loaded[-1].get("role") == "assistant":
+                    st.session_state.current_emotion = loaded[-1].get("emotion", "neutral")
+                st.success("Chat loaded.")
+                st.rerun()
+            else:
+                st.error("That file doesn't look like a Cheat Mind chat export.")
+        except Exception as e:
+            st.error(f"Couldn't load that file: {e}")
 
     st.divider()
     st.caption("Built with Streamlit + Gemini · Cheat Mind")
@@ -167,6 +300,23 @@ st.markdown(
 st.title("🧠 Cheat Mind")
 st.caption("An AI chatbot that listens, talks, and reacts with emotion.")
 
+st.session_state.mode = st.radio(
+    "Mode",
+    ["Comfort", "Coding Help", "Study Help"],
+    horizontal=True,
+    index=["Comfort", "Coding Help", "Study Help"].index(st.session_state.mode),
+    label_visibility="collapsed",
+)
+if st.session_state.mode == "Coding Help":
+    st.caption("💻 Coding Help mode — direct, code-first answers instead of the comfort persona.")
+elif st.session_state.mode == "Study Help":
+    st.session_state.study_subject = st.selectbox(
+        "Subject",
+        list(WASSCE_SUBJECTS.keys()),
+        index=list(WASSCE_SUBJECTS.keys()).index(st.session_state.study_subject),
+    )
+    st.caption(f"📚 Study Help mode — {st.session_state.study_subject} exam prep: essay/answer feedback, quizzes, and explanations.")
+
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
@@ -203,9 +353,13 @@ def speak(text: str, rate: float = 1.0):
 def get_response(parts):
     """Send text or audio parts to Gemini and return (transcript, reply, emotion, user_mood)."""
     genai.configure(api_key=api_key)
+    if st.session_state.mode == "Study Help":
+        instruction = build_study_instruction(st.session_state.study_subject)
+    else:
+        instruction = MODE_INSTRUCTIONS[st.session_state.mode]
     model = genai.GenerativeModel(
         model_name=model_name,
-        system_instruction=SYSTEM_INSTRUCTION,
+        system_instruction=instruction,
     )
 
     convo = []
