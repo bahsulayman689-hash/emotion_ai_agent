@@ -1,0 +1,7 @@
+{"id": "newtons-laws", "title": "Newton's Three Laws of Motion", "text": "First law: an object stays at rest or in uniform motion unless acted on by a net force. Second law: force = mass x acceleration (F=ma). Third law: for every action there is an equal and opposite reaction."}
+{"id": "speed-velocity", "title": "Speed, Velocity, and Acceleration", "text": "Speed = distance/time. Velocity is speed with direction. Acceleration = change in velocity / time taken, measured in m/s^2."}
+{"id": "ohms-law", "title": "Ohm's Law", "text": "Voltage = Current x Resistance (V=IR). This describes the relationship between voltage, current, and resistance in an electrical circuit."}
+{"id": "energy-conservation", "title": "Conservation of Energy", "text": "Energy cannot be created or destroyed, only transformed from one form to another (e.g. kinetic to potential). Total energy in a closed system remains constant."}
+{"id": "kinetic-potential-energy", "title": "Kinetic and Potential Energy", "text": "Kinetic energy = 1/2 x mass x velocity^2. Gravitational potential energy = mass x gravity x height (PE = mgh)."}
+{"id": "waves-basics", "title": "Wave Basics", "text": "Wave speed = frequency x wavelength (v = fλ). Frequency is measured in Hertz (cycles per second); wavelength is the distance between two successive peaks."}
+{"id": "density", "title": "Density", "text": "Density = mass / volume, commonly measured in kg/m^3 or g/cm^3. Objects denser than a fluid sink; less dense objects float."}
