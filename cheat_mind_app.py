@@ -22,6 +22,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -29,6 +30,13 @@ import google.generativeai as genai
 import chromadb
 from chromadb.utils import embedding_functions
 from streamlit_mic_recorder import mic_recorder
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSHEETS_AVAILABLE = True
+except ImportError:
+    GSHEETS_AVAILABLE = False
 
 # ----------------------------------------------------------------------
 # Config
@@ -74,6 +82,19 @@ IMAGE_MIME_MAP = {
     "jpeg": "image/jpeg",
     "webp": "image/webp",
 }
+
+REPLY_LANGUAGES = [
+    "Auto (match user)",
+    "English",
+    "Wolof",
+    "Mandinka",
+    "Fula (Pulaar)",
+    "Jola",
+    "Serer",
+    "Soninke",
+    "Jula (Dyula)",
+    "French",
+]
 
 SYSTEM_INSTRUCTION = (
     "You are Cheat Mind, a witty, emotionally expressive AI companion capable of hearing "
@@ -175,24 +196,46 @@ def build_study_instruction(subject: str, grounding_context: str = "") -> str:
 
 
 # ----------------------------------------------------------------------
-# RAG grounding for Civic Education (local Chroma store)
+# RAG grounding for Study Help subjects (local Chroma store per subject)
 # ----------------------------------------------------------------------
 
-CIVIC_KB_PATH = os.path.join(os.path.dirname(__file__), "civic_education_kb.jsonl")
+# Maps a WASSCE subject to its local knowledge-base file (must sit next to app.py).
+# Subjects not listed here get no RAG grounding — Study Help still works for them,
+# just relying on the model's general knowledge instead of a curated reference set.
+SUBJECT_KB_FILES = {
+    "Civic Education": "civic_education_kb.jsonl",
+    "Mathematics (Core)": "math_kb.jsonl",
+    "Physics": "physics_kb.jsonl",
+    "Chemistry": "chemistry_kb.jsonl",
+    "Biology": "biology_kb.jsonl",
+    "Literature in English": "literature_kb.jsonl",
+    "History": "history_kb.jsonl",
+    "Government": "government_kb.jsonl",
+    "Financial Accounting": "accounting_kb.jsonl",
+    "Commerce": "commerce_kb.jsonl",
+    "Economics": "economics_kb.jsonl",
+}
 
 
 @st.cache_resource
-def get_civic_collection():
-    """Builds (once, cached) a local Chroma collection from civic_education_kb.jsonl."""
+def get_subject_collection(subject: str):
+    """Builds (once per subject, cached) a local Chroma collection from that
+    subject's knowledge-base file, if one is configured."""
     client = chromadb.Client()  # in-memory; rebuilt each app restart
     embed_fn = embedding_functions.DefaultEmbeddingFunction()
-    collection = client.create_collection("civic_education", embedding_function=embed_fn)
+    collection_name = "kb_" + re.sub(r"[^a-z0-9]+", "_", subject.lower()).strip("_")
+    collection = client.create_collection(collection_name, embedding_function=embed_fn)
 
-    if not os.path.exists(CIVIC_KB_PATH):
-        return collection  # empty collection if the KB file wasn't shipped alongside app.py
+    kb_filename = SUBJECT_KB_FILES.get(subject)
+    if not kb_filename:
+        return collection  # no KB configured for this subject yet
+
+    kb_path = os.path.join(os.path.dirname(__file__), kb_filename)
+    if not os.path.exists(kb_path):
+        return collection  # KB file wasn't shipped alongside app.py
 
     records = []
-    with open(CIVIC_KB_PATH, "r", encoding="utf-8") as f:
+    with open(kb_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -207,10 +250,10 @@ def get_civic_collection():
     return collection
 
 
-def retrieve_civic_context(query: str, k: int = 2) -> str:
-    """Returns the top-k most relevant civic-education passages for a query, or ''."""
+def retrieve_subject_context(subject: str, query: str, k: int = 2) -> str:
+    """Returns the top-k most relevant reference passages for a subject/query, or ''."""
     try:
-        collection = get_civic_collection()
+        collection = get_subject_collection(subject)
         if collection.count() == 0:
             return ""
         results = collection.query(query_texts=[query], n_results=k)
@@ -271,11 +314,46 @@ GENERAL_SYSTEM_INSTRUCTION = (
     "calming tune or story, not a diagnosis. Default to 'neutral' if unclear."
 )
 
+POETRY_SYSTEM_INSTRUCTION = (
+    "You are Cheat Mind in Poetry Help mode. Here you help the user write their OWN poetry "
+    "better — you are a writing coach, not a poem vending machine. Save the emotional-"
+    "companion framing for Comfort mode — here, be warm but focused on developing the "
+    "user's craft. "
+    "For every user message (typed or spoken), respond ONLY with strict JSON, no markdown "
+    "fences around the JSON itself, no extra text, in this exact shape: "
+    '{"transcript": "...", "reply": "...", "emotion": "...", "user_mood": "..."}. '
+    "'transcript' is what the user said — repeat typed text verbatim, or transcribe spoken "
+    "audio verbatim (in the language it was spoken). "
+    "'reply' is your poetry-help answer. Adapt to what's asked: "
+    "if given a draft to review, give specific, encouraging feedback on imagery, rhythm, "
+    "word choice, and structure, and suggest 1-2 concrete alternate lines or phrasings as "
+    "examples rather than rewriting the whole poem for them; "
+    "if asked about a technique or form (metaphor, alliteration, enjambment, sonnet, haiku, "
+    "free verse, etc.), explain it clearly with a short original example, not an existing "
+    "published poem; "
+    "if asked for a prompt or starting line to spark their own writing, give one short, "
+    "evocative prompt rather than a finished poem; "
+    "if the user explicitly asks you to write a full poem for them (not help improve their "
+    "own), you may write a short original one, but always encourage them to make it their "
+    "own by editing it rather than just using it as-is. "
+    "Never reproduce existing copyrighted poems, song lyrics, or published verse, even a "
+    "line or two — always write fresh, original material. "
+    "Keep tone warm, encouraging, and craft-focused — like a good writing mentor, not a "
+    "harsh critic. "
+    "'emotion' is the single feeling you have while replying, chosen from exactly this "
+    f"list: {', '.join(EMOTIONS.keys())} — for this mode it will usually be 'curious', "
+    "'thinking', or 'happy'. "
+    "'user_mood' is your best light read of how the user seems to be feeling in this "
+    "message, chosen from the same list — used only to decide whether to gently offer a "
+    "calming tune or story, not a diagnosis. Default to 'neutral' if unclear."
+)
+
 MODE_INSTRUCTIONS = {
     "Comfort": SYSTEM_INSTRUCTION,
     "Coding Help": CODING_SYSTEM_INSTRUCTION,
     "Sales & Business": SALES_SYSTEM_INSTRUCTION,
     "General": GENERAL_SYSTEM_INSTRUCTION,
+    "Poetry Help": POETRY_SYSTEM_INSTRUCTION,
     # "Study Help" is built dynamically per selected subject — see build_study_instruction()
 }
 
@@ -338,9 +416,25 @@ with st.sidebar:
     )
     st.session_state.reply_language = st.selectbox(
         "Reply language",
-        ["Auto (match user)", "English", "Wolof", "Mandinka", "French"],
-        index=["Auto (match user)", "English", "Wolof", "Mandinka", "French"].index(st.session_state.reply_language),
+        REPLY_LANGUAGES,
+        index=REPLY_LANGUAGES.index(st.session_state.reply_language),
     )
+
+    st.divider()
+    st.header("📊 Study Tracking")
+    if not GSHEETS_AVAILABLE:
+        st.caption("Install `gspread` and `google-auth` (see requirements) to log study sessions to Google Sheets.")
+        gsheet_creds_file = None
+        gsheet_url = ""
+    else:
+        gsheet_creds_file = st.file_uploader(
+            "Google service account JSON", type=["json"], key="gsheet_creds"
+        )
+        gsheet_url = st.text_input("Google Sheet URL or ID", key="gsheet_url")
+        st.caption(
+            "Share the sheet with your service account's email (inside the JSON file) "
+            "as an Editor first, then paste the sheet's URL here."
+        )
 
     st.divider()
     st.header("🔊 Voice")
@@ -440,7 +534,132 @@ st.markdown(
 st.title(f"🧠 {st.session_state.companion_name}")
 st.caption("An AI chatbot that listens, talks, and reacts with emotion.")
 
-MODES = ["Comfort", "Coding Help", "Study Help", "Sales & Business", "General"]
+@st.cache_resource(show_spinner=False)
+def get_gsheet_worksheet(creds_json_str, sheet_ref):
+    """Connects to (or creates) the 'Cheat Mind Study Log' worksheet in the given sheet."""
+    creds_dict = json.loads(creds_json_str)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(credentials)
+
+    if sheet_ref.startswith("http"):
+        sh = client.open_by_url(sheet_ref)
+    else:
+        sh = client.open_by_key(sheet_ref)
+
+    try:
+        ws = sh.worksheet("Cheat Mind Study Log")
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title="Cheat Mind Study Log", rows=1000, cols=6)
+        ws.append_row(["Timestamp", "Subject", "Minutes Studied", "Note", "Mood"])
+    return ws
+
+
+def log_study_session(minutes_studied, note=""):
+    """Appends a row to the Google Sheet study log, if it's configured. Returns (ok, message)."""
+    if not GSHEETS_AVAILABLE:
+        return False, "Google Sheets logging isn't installed (missing gspread/google-auth)."
+    if not gsheet_creds_file or not gsheet_url:
+        return False, "Add a service account JSON and Sheet URL in the sidebar first."
+    try:
+        creds_json_str = gsheet_creds_file.getvalue().decode("utf-8")
+        ws = get_gsheet_worksheet(creds_json_str, gsheet_url)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws.append_row([
+            timestamp,
+            st.session_state.study_subject,
+            minutes_studied,
+            note,
+            st.session_state.current_emotion,
+        ])
+        return True, "Logged to Google Sheets."
+    except Exception as e:
+        return False, f"Couldn't log to Google Sheets: {e}"
+
+
+def play_timer_chime():
+    """Plays a short original ascending chime via the Web Audio API when the study timer ends."""
+    components.html(
+        """
+        <script>
+        try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const notes = [523.25, 659.25, 783.99, 1046.50];
+            let t = ctx.currentTime + 0.05;
+            notes.forEach((freq) => {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = "sine";
+                osc.frequency.value = freq;
+                gain.gain.setValueAtTime(0, t);
+                gain.gain.linearRampToValueAtTime(0.15, t + 0.05);
+                gain.gain.linearRampToValueAtTime(0, t + 0.4);
+                osc.connect(gain).connect(ctx.destination);
+                osc.start(t);
+                osc.stop(t + 0.45);
+                t += 0.3;
+            });
+        } catch (e) { console.log("Audio unavailable:", e); }
+        </script>
+        """,
+        height=0,
+    )
+
+
+def render_study_timer(minutes: int, key_suffix: str):
+    """Renders a self-contained JS countdown timer (no server round-trip needed while running)."""
+    total_seconds = int(minutes * 60)
+    components.html(
+        f"""
+        <div id="timer-box-{key_suffix}" style="
+            font-family: sans-serif; text-align: center; padding: 16px;
+            border-radius: 14px; background: #4D96FF11; border: 2px solid #4D96FF33;
+        ">
+            <div id="timer-display-{key_suffix}" style="font-size: 40px; font-weight: 700; color: #4D96FF;">
+                {minutes:02d}:00
+            </div>
+            <div style="color: #666; margin-top: 4px;">Study timer running — stay focused!</div>
+        </div>
+        <script>
+        (function() {{
+            let remaining = {total_seconds};
+            const display = document.getElementById("timer-display-{key_suffix}");
+            const interval = setInterval(() => {{
+                remaining -= 1;
+                const m = Math.floor(remaining / 60).toString().padStart(2, "0");
+                const s = (remaining % 60).toString().padStart(2, "0");
+                if (display) display.textContent = m + ":" + s;
+                if (remaining <= 0) {{
+                    clearInterval(interval);
+                    if (display) display.textContent = "Time's up! ⏰";
+                    try {{
+                        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                        const notes = [523.25, 659.25, 783.99, 1046.50];
+                        let t = ctx.currentTime + 0.05;
+                        notes.forEach((freq) => {{
+                            const osc = ctx.createOscillator();
+                            const gain = ctx.createGain();
+                            osc.type = "sine";
+                            osc.frequency.value = freq;
+                            gain.gain.setValueAtTime(0, t);
+                            gain.gain.linearRampToValueAtTime(0.15, t + 0.05);
+                            gain.gain.linearRampToValueAtTime(0, t + 0.4);
+                            osc.connect(gain).connect(ctx.destination);
+                            osc.start(t);
+                            osc.stop(t + 0.45);
+                            t += 0.3;
+                        }});
+                    }} catch (e) {{ console.log("Audio unavailable:", e); }}
+                }}
+            }}, 1000);
+        }})();
+        </script>
+        """,
+        height=110,
+    )
+
+
+MODES = ["Comfort", "Coding Help", "Study Help", "Sales & Business", "Poetry Help", "General"]
 
 st.session_state.mode = st.radio(
     "Mode",
@@ -458,8 +677,44 @@ elif st.session_state.mode == "Study Help":
         index=list(WASSCE_SUBJECTS.keys()).index(st.session_state.study_subject),
     )
     st.caption(f"📚 Study Help mode — {st.session_state.study_subject} exam prep: essay/answer feedback, quizzes, and explanations.")
+
+    with st.expander("⏱️ Study timer & session log"):
+        if "study_timer_minutes" not in st.session_state:
+            st.session_state.study_timer_minutes = 25
+        if "study_timer_running" not in st.session_state:
+            st.session_state.study_timer_running = False
+
+        st.session_state.study_timer_minutes = st.number_input(
+            "Minutes", min_value=1, max_value=180, value=st.session_state.study_timer_minutes
+        )
+        col_start, col_stop = st.columns(2)
+        with col_start:
+            if st.button("▶️ Start timer", use_container_width=True):
+                st.session_state.study_timer_running = True
+        with col_stop:
+            if st.button("⏹ Stop timer", use_container_width=True):
+                st.session_state.study_timer_running = False
+
+        if st.session_state.study_timer_running:
+            render_study_timer(st.session_state.study_timer_minutes, key_suffix="study")
+
+        st.divider()
+        st.caption("Log a completed study session:")
+        log_minutes = st.number_input(
+            "Minutes studied", min_value=1, max_value=600,
+            value=st.session_state.study_timer_minutes, key="log_minutes_input"
+        )
+        log_note = st.text_input("Note (optional)", key="log_note_input", placeholder="e.g. Covered essay structure")
+        if st.button("✅ Log this session"):
+            ok, message = log_study_session(log_minutes, log_note)
+            if ok:
+                st.success(message)
+            else:
+                st.warning(message)
 elif st.session_state.mode == "Sales & Business":
     st.caption("💰 Sales & Business mode — pricing, pitches, finding customers, and growing income.")
+elif st.session_state.mode == "Poetry Help":
+    st.caption("✍️ Poetry Help mode — feedback, prompts, and craft tips to help you write your own poems.")
 elif st.session_state.mode == "General":
     st.caption("🌐 General mode — ask about anything.")
 
@@ -497,7 +752,10 @@ def apply_personalization(instruction: str) -> str:
     if lang != "Auto (match user)":
         extra += (
             f"Write your 'reply' field in {lang}, regardless of what language the user wrote "
-            "or spoke in, unless they explicitly ask for a different language. "
+            "or spoke in, unless they explicitly ask for a different language. If your "
+            f"fluency in {lang} is limited, do your best and keep sentences simple and clear "
+            "rather than producing confident-sounding but inaccurate text — accuracy matters "
+            "more than sounding fluent. "
         )
     else:
         extra += "Write your 'reply' field in the same language the user used, unless they ask otherwise. "
@@ -544,10 +802,10 @@ def get_response(parts):
     genai.configure(api_key=api_key)
     if st.session_state.mode == "Study Help":
         grounding_context = ""
-        if st.session_state.study_subject == "Civic Education":
+        if st.session_state.study_subject in SUBJECT_KB_FILES:
             query_text = next((p for p in parts if isinstance(p, str)), None)
             if query_text:
-                grounding_context = retrieve_civic_context(query_text)
+                grounding_context = retrieve_subject_context(st.session_state.study_subject, query_text)
         instruction = build_study_instruction(st.session_state.study_subject, grounding_context)
     else:
         instruction = MODE_INSTRUCTIONS[st.session_state.mode]
