@@ -38,6 +38,13 @@ try:
 except ImportError:
     GSHEETS_AVAILABLE = False
 
+try:
+    from google import genai as veo_genai
+    from google.genai import types as veo_types
+    VEO_AVAILABLE = True
+except ImportError:
+    VEO_AVAILABLE = False
+
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
@@ -263,6 +270,79 @@ def retrieve_subject_context(subject: str, query: str, k: int = 2) -> str:
         return ""  # RAG is an enhancement, never block a reply if retrieval fails
 
 
+def call_with_retry(fn, max_retries=3, base_delay=1.5):
+    """Call fn() with exponential backoff retry on transient errors.
+    Re-raises the last exception if all attempts fail, so callers keep their
+    existing error handling.
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    raise last_error
+
+
+def extract_json_array(text: str):
+    """Best-effort extraction of a JSON array from a model response."""
+    text = text.strip()
+    text = re.sub(r"^```(json)?", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
+        text = match.group(0)
+    return json.loads(text)
+
+
+def generate_quiz(subject: str, num_questions: int):
+    """Generates a list of multiple-choice quiz questions for a subject via Gemini.
+    Returns a list of dicts: {"question", "options": {"a":..,"b":..,...}, "correct", "explanation"}
+    or None on failure (with an error already shown via st.error).
+    """
+    if not api_key:
+        st.error("Add your Gemini API key in the sidebar first.")
+        return None
+
+    grounding = ""
+    if subject in SUBJECT_KB_FILES:
+        passages = retrieve_subject_context(subject, subject, k=6)
+        if passages:
+            grounding = "\n\nReference passages you can base some questions on:\n" + passages
+
+    prompt = (
+        f"Generate {num_questions} WASSCE-style multiple-choice practice questions for the "
+        f"subject '{subject}'. Vary the topics and difficulty within the subject. "
+        "Respond ONLY with a strict JSON array, no markdown fences, no extra text, in this "
+        'exact shape: [{"question": "...", "options": {"a": "...", "b": "...", "c": "...", '
+        '"d": "..."}, "correct": "a", "explanation": "..."}, ...]. '
+        "'correct' must be one of the lowercase option letters (a/b/c/d) matching the right "
+        "answer. 'explanation' should briefly explain why that answer is correct, in one or "
+        "two sentences." + grounding
+    )
+
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name=model_name)
+        result = call_with_retry(
+            lambda: model.generate_content(
+                prompt, generation_config={"response_mime_type": "application/json"}
+            )
+        )
+        quiz = extract_json_array(result.text)
+        # Basic shape validation so a malformed response doesn't crash the UI later.
+        quiz = [
+            q for q in quiz
+            if isinstance(q, dict) and "question" in q and "options" in q and "correct" in q
+        ]
+        return quiz if quiz else None
+    except Exception as e:
+        st.error(f"Couldn't generate the quiz: {e}")
+        return None
+
+
 SALES_SYSTEM_INSTRUCTION = (
     "You are Cheat Mind in Sales & Business Help mode. Here you are a practical, "
     "street-smart business advisor helping the user sell products/services and grow income "
@@ -354,6 +434,9 @@ MODE_INSTRUCTIONS = {
     "Sales & Business": SALES_SYSTEM_INSTRUCTION,
     "General": GENERAL_SYSTEM_INSTRUCTION,
     "Poetry Help": POETRY_SYSTEM_INSTRUCTION,
+    # Video Studio doesn't use the chat flow, but falls back to General instructions
+    # if someone types a message while that mode is selected, instead of erroring.
+    "Video Studio": GENERAL_SYSTEM_INSTRUCTION,
     # "Study Help" is built dynamically per selected subject — see build_study_instruction()
 }
 
@@ -379,6 +462,59 @@ if "companion_tone" not in st.session_state:
     st.session_state.companion_tone = "Balanced"
 if "reply_language" not in st.session_state:
     st.session_state.reply_language = "Auto (match user)"
+if "dark_mode" not in st.session_state:
+    st.session_state.dark_mode = False
+if "onboarding_dismissed" not in st.session_state:
+    st.session_state.onboarding_dismissed = False
+
+# ----------------------------------------------------------------------
+# Dark mode CSS — injected early so it applies from first paint
+# ----------------------------------------------------------------------
+
+if st.session_state.dark_mode:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stAppViewContainer"], [data-testid="stHeader"], .main {
+            background-color: #121212 !important;
+            color: #e6e6e6 !important;
+        }
+        [data-testid="stSidebar"] {
+            background-color: #1a1a1a !important;
+        }
+        [data-testid="stSidebar"] * {
+            color: #e6e6e6 !important;
+        }
+        .stMarkdown, .stCaption, p, span, label, h1, h2, h3, h4,
+        [data-testid="stChatMessageContent"], [data-testid="stMetricValue"] {
+            color: #e6e6e6 !important;
+        }
+        .stTextInput input, .stTextArea textarea, .stNumberInput input,
+        [data-baseweb="select"] > div {
+            background-color: #2a2a2a !important;
+            color: #e6e6e6 !important;
+            border-color: #444 !important;
+        }
+        .stButton button, .stDownloadButton button {
+            background-color: #2a2a2a !important;
+            color: #e6e6e6 !important;
+            border: 1px solid #444 !important;
+        }
+        [data-testid="stChatMessage"] {
+            background-color: #1e1e1e !important;
+            border-radius: 12px;
+        }
+        [data-testid="stExpander"], [data-testid="stContainer"] {
+            background-color: #1a1a1a !important;
+            border-color: #333 !important;
+        }
+        hr {
+            border-color: #333 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def build_export_json():
@@ -406,6 +542,7 @@ with st.sidebar:
 
     st.divider()
     st.header("🧑‍🎨 Personalize")
+    st.session_state.dark_mode = st.toggle("🌙 Dark mode", value=st.session_state.dark_mode)
     st.session_state.companion_name = st.text_input(
         "Companion name", value=st.session_state.companion_name
     ) or "Cheat Mind"
@@ -445,6 +582,9 @@ with st.sidebar:
     if st.button("🗑️ Clear chat"):
         st.session_state.history = []
         st.session_state.current_emotion = "neutral"
+        st.rerun()
+    if st.button("❓ Show welcome guide again"):
+        st.session_state.onboarding_dismissed = False
         st.rerun()
 
     st.divider()
@@ -533,6 +673,30 @@ st.markdown(
 
 st.title(f"🧠 {st.session_state.companion_name}")
 st.caption("An AI chatbot that listens, talks, and reacts with emotion.")
+
+if not st.session_state.onboarding_dismissed:
+    with st.container(border=True):
+        st.markdown(f"### 👋 Welcome to {st.session_state.companion_name}!")
+        st.markdown(
+            "**6 modes, pick with the tabs below:**\n"
+            "- 💙 **Comfort** — an emotionally supportive companion for when things feel heavy\n"
+            "- 💻 **Coding Help** — direct, code-first answers to programming questions\n"
+            "- 📚 **Study Help** — WASSCE exam prep across 12 subjects, with quizzes, essay/answer "
+            "feedback, and reference-grounded answers for 11 of them\n"
+            "- 💰 **Sales & Business** — pricing, pitches, finding customers, growing income\n"
+            "- ✍️ **Poetry Help** — feedback and craft tips to help you write your own poems\n"
+            "- 🌐 **General** — anything else\n\n"
+            "**Talk to it however's easiest:** type, hit the mic to talk live, attach a photo "
+            "(a textbook page, a product, anything), or send an emoji.\n\n"
+            "**In Study Help**, there's also a ⏱️ built-in study timer and optional Google Sheets "
+            "logging for tracking sessions.\n\n"
+            "**In the sidebar** you can rename your companion, set its tone, pick a reply "
+            "language (English, Wolof, Mandinka, Fula, and more), switch to 🌙 dark mode, and "
+            "export or reload past conversations."
+        )
+        if st.button("Got it, let's start! 🚀"):
+            st.session_state.onboarding_dismissed = True
+            st.rerun()
 
 @st.cache_resource(show_spinner=False)
 def get_gsheet_worksheet(creds_json_str, sheet_ref):
@@ -659,7 +823,95 @@ def render_study_timer(minutes: int, key_suffix: str):
     )
 
 
-MODES = ["Comfort", "Coding Help", "Study Help", "Sales & Business", "Poetry Help", "General"]
+# Cheapest-first ordering; Lite has no 4K/Extension support but is far cheaper for testing.
+VEO_MODELS = {
+    "Veo 3.1 Lite (cheapest, best for testing)": "veo-3.1-lite-generate-preview",
+    "Veo 3.1 Fast": "veo-3.1-fast-generate-preview",
+    "Veo 3.1 Standard (highest quality, most expensive)": "veo-3.1-generate-preview",
+}
+
+# Rough per-second USD estimates (720p, with audio) as of Aug 2026 — Google's actual
+# billing is the source of truth; this is only a ballpark so the cost warning has real
+# numbers. Check https://ai.google.dev/gemini-api/docs/pricing for current rates.
+VEO_COST_PER_SECOND = {
+    "veo-3.1-lite-generate-preview": 0.05,
+    "veo-3.1-fast-generate-preview": 0.12,
+    "veo-3.1-generate-preview": 0.40,
+}
+
+
+def render_video_studio():
+    """Renders the Video Studio UI: prompt, duration, cost estimate, and generation."""
+    if not VEO_AVAILABLE:
+        st.warning(
+            "Video generation needs the `google-genai` package (a different package from "
+            "`google-generativeai`, which the rest of the app uses). Add it to your "
+            "requirements.txt and reinstall to enable this."
+        )
+        return
+
+    with st.container(border=True):
+        st.markdown(
+            "⚠️ **This costs real money — there is no free tier for video generation.** "
+            "You need a Gemini API key with billing/a paid tier enabled (a different "
+            "requirement than the free key used for chat). You are only charged if a "
+            "video successfully generates."
+        )
+
+    video_model_label = st.selectbox("Model", list(VEO_MODELS.keys()))
+    video_model = VEO_MODELS[video_model_label]
+
+    video_prompt = st.text_area(
+        "Describe the video you want",
+        placeholder="e.g. A drone shot slowly rising over a busy Gambian market at sunset",
+        height=80,
+    )
+    duration = st.selectbox("Duration (seconds)", [4, 6, 8], index=2)
+
+    est_cost = VEO_COST_PER_SECOND.get(video_model, 0.4) * duration
+    st.caption(f"💵 Estimated cost: **~${est_cost:.2f}** for this {duration}-second clip (ballpark — check your Google Cloud billing for the real charge).")
+
+    confirmed = st.checkbox("I understand this will charge my Google Cloud billing account.")
+
+    if st.button("🎬 Generate video", disabled=not (video_prompt and confirmed)):
+        if not api_key:
+            st.error("Add your Gemini API key in the sidebar first.")
+            return
+        try:
+            client = veo_genai.Client(api_key=api_key)
+            with st.spinner("Generating video — this typically takes 1-3 minutes..."):
+                operation = client.models.generate_videos(
+                    model=video_model,
+                    prompt=video_prompt,
+                    config=veo_types.GenerateVideosConfig(
+                        number_of_videos=1,
+                        duration_seconds=duration,
+                    ),
+                )
+                while not operation.done:
+                    time.sleep(15)
+                    operation = client.operations.get(operation)
+
+            generated = operation.response.generated_videos[0]
+            out_path = os.path.join(os.getcwd(), "cheat_mind_generated_video.mp4")
+            client.files.download(file=generated.video)
+            generated.video.save(out_path)
+
+            st.success("Video generated!")
+            st.video(out_path)
+            with open(out_path, "rb") as f:
+                st.download_button("⬇️ Download video", f, file_name="cheat_mind_video.mp4", mime="video/mp4")
+        except Exception as e:
+            st.error(
+                f"Video generation failed: {e}\n\n"
+                "Common causes: the API key isn't on a paid/billed tier, the `google-genai` "
+                "SDK version is out of date (Veo's API surface has changed across versions — "
+                "check https://ai.google.dev/gemini-api/docs/video for the current method "
+                "signatures), or the prompt was rejected by content filters."
+            )
+
+
+MODES = ["Comfort", "Coding Help", "Study Help", "Sales & Business", "Poetry Help", "General", "Video Studio"]
 
 st.session_state.mode = st.radio(
     "Mode",
@@ -711,12 +963,80 @@ elif st.session_state.mode == "Study Help":
                 st.success(message)
             else:
                 st.warning(message)
+
+    with st.expander("📝 Practice quiz"):
+        if "current_quiz" not in st.session_state:
+            st.session_state.current_quiz = None
+        if "quiz_answers" not in st.session_state:
+            st.session_state.quiz_answers = {}
+        if "quiz_submitted" not in st.session_state:
+            st.session_state.quiz_submitted = False
+
+        num_q = st.slider("Number of questions", 3, 10, 5, key="quiz_num_q")
+        if st.button("🎲 Generate new quiz"):
+            with st.spinner("Writing quiz questions..."):
+                quiz = generate_quiz(st.session_state.study_subject, num_q)
+            if quiz:
+                st.session_state.current_quiz = quiz
+                st.session_state.quiz_answers = {}
+                st.session_state.quiz_submitted = False
+                st.rerun()
+
+        if st.session_state.current_quiz:
+            st.divider()
+            for i, q in enumerate(st.session_state.current_quiz):
+                options = q.get("options", {})
+                option_keys = list(options.keys())
+                labels = [f"{k.upper()}) {options[k]}" for k in option_keys]
+
+                st.markdown(f"**{i + 1}. {q['question']}**")
+                default_index = None
+                if i in st.session_state.quiz_answers and st.session_state.quiz_answers[i] in option_keys:
+                    default_index = option_keys.index(st.session_state.quiz_answers[i])
+
+                selected = st.radio(
+                    f"question_{i}", labels, key=f"quiz_radio_{i}",
+                    label_visibility="collapsed", index=default_index,
+                    disabled=st.session_state.quiz_submitted,
+                )
+                if selected and not st.session_state.quiz_submitted:
+                    st.session_state.quiz_answers[i] = option_keys[labels.index(selected)]
+
+                if st.session_state.quiz_submitted:
+                    correct_key = q.get("correct", "")
+                    user_key = st.session_state.quiz_answers.get(i)
+                    if user_key == correct_key:
+                        st.success(f"✅ Correct! {q.get('explanation', '')}")
+                    else:
+                        correct_text = options.get(correct_key, "?")
+                        st.error(f"❌ Correct answer: {correct_key.upper()}) {correct_text}. {q.get('explanation', '')}")
+                st.divider()
+
+            if not st.session_state.quiz_submitted:
+                if st.button("✅ Submit answers"):
+                    st.session_state.quiz_submitted = True
+                    st.rerun()
+            else:
+                score = sum(
+                    1 for i, q in enumerate(st.session_state.current_quiz)
+                    if st.session_state.quiz_answers.get(i) == q.get("correct")
+                )
+                total = len(st.session_state.current_quiz)
+                st.markdown(f"### Score: {score}/{total}")
+                if st.button("🔁 Retake / new quiz"):
+                    st.session_state.current_quiz = None
+                    st.session_state.quiz_answers = {}
+                    st.session_state.quiz_submitted = False
+                    st.rerun()
 elif st.session_state.mode == "Sales & Business":
     st.caption("💰 Sales & Business mode — pricing, pitches, finding customers, and growing income.")
 elif st.session_state.mode == "Poetry Help":
     st.caption("✍️ Poetry Help mode — feedback, prompts, and craft tips to help you write your own poems.")
 elif st.session_state.mode == "General":
     st.caption("🌐 General mode — ask about anything.")
+elif st.session_state.mode == "Video Studio":
+    st.caption("🎬 Video Studio — generate short AI video clips from a text prompt (Veo).")
+    render_video_studio()
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -761,22 +1081,6 @@ def apply_personalization(instruction: str) -> str:
         extra += "Write your 'reply' field in the same language the user used, unless they ask otherwise. "
 
     return instruction + "\n\n" + extra
-
-
-def call_with_retry(fn, max_retries=3, base_delay=1.5):
-    """Call fn() with exponential backoff retry on transient errors.
-    Re-raises the last exception if all attempts fail, so callers keep their
-    existing error handling.
-    """
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            return fn()
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                time.sleep(base_delay * (2 ** attempt))
-    raise last_error
 
 
 def speak(text: str, rate: float = 1.0):
