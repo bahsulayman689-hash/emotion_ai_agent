@@ -4,3 +4,4 @@ streamlit-mic-recorder>=0.0.8
 chromadb
 gspread
 google-auth
+google-genai
