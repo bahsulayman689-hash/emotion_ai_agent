@@ -22,6 +22,7 @@ import json
 import os
 import re
 import time
+import uuid
 from datetime import datetime
 
 import streamlit as st
@@ -270,79 +271,6 @@ def retrieve_subject_context(subject: str, query: str, k: int = 2) -> str:
         return ""  # RAG is an enhancement, never block a reply if retrieval fails
 
 
-def call_with_retry(fn, max_retries=3, base_delay=1.5):
-    """Call fn() with exponential backoff retry on transient errors.
-    Re-raises the last exception if all attempts fail, so callers keep their
-    existing error handling.
-    """
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            return fn()
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                time.sleep(base_delay * (2 ** attempt))
-    raise last_error
-
-
-def extract_json_array(text: str):
-    """Best-effort extraction of a JSON array from a model response."""
-    text = text.strip()
-    text = re.sub(r"^```(json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if match:
-        text = match.group(0)
-    return json.loads(text)
-
-
-def generate_quiz(subject: str, num_questions: int):
-    """Generates a list of multiple-choice quiz questions for a subject via Gemini.
-    Returns a list of dicts: {"question", "options": {"a":..,"b":..,...}, "correct", "explanation"}
-    or None on failure (with an error already shown via st.error).
-    """
-    if not api_key:
-        st.error("Add your Gemini API key in the sidebar first.")
-        return None
-
-    grounding = ""
-    if subject in SUBJECT_KB_FILES:
-        passages = retrieve_subject_context(subject, subject, k=6)
-        if passages:
-            grounding = "\n\nReference passages you can base some questions on:\n" + passages
-
-    prompt = (
-        f"Generate {num_questions} WASSCE-style multiple-choice practice questions for the "
-        f"subject '{subject}'. Vary the topics and difficulty within the subject. "
-        "Respond ONLY with a strict JSON array, no markdown fences, no extra text, in this "
-        'exact shape: [{"question": "...", "options": {"a": "...", "b": "...", "c": "...", '
-        '"d": "..."}, "correct": "a", "explanation": "..."}, ...]. '
-        "'correct' must be one of the lowercase option letters (a/b/c/d) matching the right "
-        "answer. 'explanation' should briefly explain why that answer is correct, in one or "
-        "two sentences." + grounding
-    )
-
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name=model_name)
-        result = call_with_retry(
-            lambda: model.generate_content(
-                prompt, generation_config={"response_mime_type": "application/json"}
-            )
-        )
-        quiz = extract_json_array(result.text)
-        # Basic shape validation so a malformed response doesn't crash the UI later.
-        quiz = [
-            q for q in quiz
-            if isinstance(q, dict) and "question" in q and "options" in q and "correct" in q
-        ]
-        return quiz if quiz else None
-    except Exception as e:
-        st.error(f"Couldn't generate the quiz: {e}")
-        return None
-
-
 SALES_SYSTEM_INSTRUCTION = (
     "You are Cheat Mind in Sales & Business Help mode. Here you are a practical, "
     "street-smart business advisor helping the user sell products/services and grow income "
@@ -434,8 +362,10 @@ MODE_INSTRUCTIONS = {
     "Sales & Business": SALES_SYSTEM_INSTRUCTION,
     "General": GENERAL_SYSTEM_INSTRUCTION,
     "Poetry Help": POETRY_SYSTEM_INSTRUCTION,
-    # Video Studio doesn't use the chat flow, but falls back to General instructions
-    # if someone types a message while that mode is selected, instead of erroring.
+    # Peer Help and Video Studio don't use the chat flow as their primary interface,
+    # but fall back to General instructions if someone types a message while
+    # selected, instead of erroring.
+    "Peer Help": GENERAL_SYSTEM_INSTRUCTION,
     "Video Studio": GENERAL_SYSTEM_INSTRUCTION,
     # "Study Help" is built dynamically per selected subject — see build_study_instruction()
 }
@@ -466,6 +396,10 @@ if "dark_mode" not in st.session_state:
     st.session_state.dark_mode = False
 if "onboarding_dismissed" not in st.session_state:
     st.session_state.onboarding_dismissed = False
+if "student_name" not in st.session_state:
+    st.session_state.student_name = ""
+if "greeted" not in st.session_state:
+    st.session_state.greeted = False
 
 # ----------------------------------------------------------------------
 # Dark mode CSS — injected early so it applies from first paint
@@ -543,9 +477,12 @@ with st.sidebar:
     st.divider()
     st.header("🧑‍🎨 Personalize")
     st.session_state.dark_mode = st.toggle("🌙 Dark mode", value=st.session_state.dark_mode)
-    st.session_state.companion_name = st.text_input(
-        "Companion name", value=st.session_state.companion_name
-    ) or "Cheat Mind"
+    st.session_state.student_name = st.text_input(
+        "Your name (shown in Peer Help)", value=st.session_state.student_name,
+        help="Used so classmates know who posted a question or reply in Peer Help mode.",
+    )
+    # Companion name is fixed as "Cheat Mind" — no longer user-editable.
+    st.session_state.companion_name = "Cheat Mind"
     st.session_state.companion_tone = st.selectbox(
         "Tone",
         ["Balanced", "Playful", "Calm & gentle"],
@@ -674,6 +611,17 @@ st.markdown(
 st.title(f"🧠 {st.session_state.companion_name}")
 st.caption("An AI chatbot that listens, talks, and reacts with emotion.")
 
+# Spoken welcome greeting — plays once per session via the same browser TTS
+# used for replies. Routed through pending_speech (rather than calling speak()
+# directly) so it's actually spoken by the existing block at the bottom of
+# the script, after speak() has been defined — and so it never overlaps with
+# a reply being read out in the same rerun. Only fires if "Speak replies
+# aloud" is on, so it respects the same voice setting as everything else.
+if not st.session_state.greeted:
+    if voice_output:
+        st.session_state.pending_speech = f"Hello, I'm {st.session_state.companion_name}, your A I companion."
+    st.session_state.greeted = True
+
 if not st.session_state.onboarding_dismissed:
     with st.container(border=True):
         st.markdown(f"### 👋 Welcome to {st.session_state.companion_name}!")
@@ -685,6 +633,7 @@ if not st.session_state.onboarding_dismissed:
             "feedback, and reference-grounded answers for 11 of them\n"
             "- 💰 **Sales & Business** — pricing, pitches, finding customers, growing income\n"
             "- ✍️ **Poetry Help** — feedback and craft tips to help you write your own poems\n"
+            "- 🤝 **Peer Help** — post questions or share your work; classmates can reply and help each other\n"
             "- 🌐 **General** — anything else\n\n"
             "**Talk to it however's easiest:** type, hit the mic to talk live, attach a photo "
             "(a textbook page, a product, anything), or send an emoji.\n\n"
@@ -692,15 +641,21 @@ if not st.session_state.onboarding_dismissed:
             "logging for tracking sessions.\n\n"
             "**In the sidebar** you can rename your companion, set its tone, pick a reply "
             "language (English, Wolof, Mandinka, Fula, and more), switch to 🌙 dark mode, and "
-            "export or reload past conversations."
+            "export or reload past conversations. You can also 👍/👎 any of my replies — that "
+            "feedback gets logged so problems can be spotted and fixed over time."
         )
         if st.button("Got it, let's start! 🚀"):
             st.session_state.onboarding_dismissed = True
             st.rerun()
 
 @st.cache_resource(show_spinner=False)
-def get_gsheet_worksheet(creds_json_str, sheet_ref):
-    """Connects to (or creates) the 'Cheat Mind Study Log' worksheet in the given sheet."""
+def get_gsheet_worksheet(creds_json_str, sheet_ref, worksheet_title="Cheat Mind Study Log", headers=None):
+    """Connects to (or creates) the given worksheet in the given sheet, adding a
+    header row if it's new. Defaults preserve the original Study Log behavior;
+    pass a different worksheet_title/headers to use this for Feedback or Peer
+    Help data instead — each combination is cached separately."""
+    if headers is None:
+        headers = ["Timestamp", "Subject", "Minutes Studied", "Note", "Mood"]
     creds_dict = json.loads(creds_json_str)
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
@@ -712,10 +667,10 @@ def get_gsheet_worksheet(creds_json_str, sheet_ref):
         sh = client.open_by_key(sheet_ref)
 
     try:
-        ws = sh.worksheet("Cheat Mind Study Log")
+        ws = sh.worksheet(worksheet_title)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title="Cheat Mind Study Log", rows=1000, cols=6)
-        ws.append_row(["Timestamp", "Subject", "Minutes Studied", "Note", "Mood"])
+        ws = sh.add_worksheet(title=worksheet_title, rows=1000, cols=max(len(headers), 6))
+        ws.append_row(headers)
     return ws
 
 
@@ -739,6 +694,226 @@ def log_study_session(minutes_studied, note=""):
         return True, "Logged to Google Sheets."
     except Exception as e:
         return False, f"Couldn't log to Google Sheets: {e}"
+
+
+# ----------------------------------------------------------------------
+# Feedback loop — 👍/👎 on assistant replies, logged to Google Sheets
+# ----------------------------------------------------------------------
+
+FEEDBACK_SHEET_NAME = "Cheat Mind Feedback Log"
+FEEDBACK_HEADERS = ["Timestamp", "Mode", "Subject", "AI Reply Snippet", "Rating", "Comment"]
+
+
+def log_feedback(rating: str, comment: str = ""):
+    """Logs a 👍/👎 on the most recent assistant reply to Google Sheets, if
+    configured. This is the feedback loop — over time it shows which modes or
+    subjects are landing well and which need a prompt or content fix."""
+    if not GSHEETS_AVAILABLE or not gsheet_creds_file or not gsheet_url:
+        return False, "Feedback needs the Google Sheets connection configured in the sidebar."
+    try:
+        creds_json_str = gsheet_creds_file.getvalue().decode("utf-8")
+        ws = get_gsheet_worksheet(creds_json_str, gsheet_url, FEEDBACK_SHEET_NAME, FEEDBACK_HEADERS)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        last_reply = next((m["content"] for m in reversed(st.session_state.history) if m["role"] == "assistant"), "")
+        snippet = (last_reply[:120] + "...") if len(last_reply) > 120 else last_reply
+        subject = st.session_state.study_subject if st.session_state.mode == "Study Help" else ""
+        ws.append_row([timestamp, st.session_state.mode, subject, snippet, rating, comment])
+        return True, "Feedback logged."
+    except Exception as e:
+        return False, f"Couldn't log feedback: {e}"
+
+
+def render_feedback_controls(idx: int, msg: dict):
+    """Renders 👍/👎 buttons under an assistant message. A 👎 reveals an
+    optional comment box before logging, so you capture *what* was off, not
+    just that it was."""
+    if msg.get("feedback"):
+        chosen = "👍 Helpful" if msg["feedback"] == "up" else "👎 Not quite"
+        st.caption(f"Feedback recorded: {chosen} — thank you!")
+        return
+
+    col1, col2, _ = st.columns([1, 1, 6])
+    with col1:
+        if st.button("👍", key=f"fb_up_{idx}"):
+            msg["feedback"] = "up"
+            log_feedback("👍")
+            st.rerun()
+    with col2:
+        if st.button("👎", key=f"fb_down_{idx}"):
+            st.session_state[f"show_fb_comment_{idx}"] = True
+            st.rerun()
+
+    if st.session_state.get(f"show_fb_comment_{idx}"):
+        comment = st.text_input("What was off about this reply? (optional)", key=f"fb_comment_input_{idx}")
+        if st.button("Submit feedback", key=f"fb_comment_submit_{idx}"):
+            msg["feedback"] = "down"
+            log_feedback("👎", comment)
+            st.session_state[f"show_fb_comment_{idx}"] = False
+            st.rerun()
+
+
+# ----------------------------------------------------------------------
+# Peer Help — students post questions/work and reply to each other,
+# stored in a shared Google Sheet (the same one used for Study Tracking).
+# Everyone who wants to see the same board needs to point to the SAME
+# sheet URL + service account JSON — there's no separate multi-user
+# backend here, so this piggybacks on the Sheets connection you already
+# have. Text-only for now; sharing photos/files would need real file
+# storage (e.g. Supabase Storage or Google Drive) added later.
+# ----------------------------------------------------------------------
+
+PEER_POSTS_SHEET = "Cheat Mind Peer Help Board"
+PEER_POSTS_HEADERS = ["Post ID", "Timestamp", "Student Name", "Subject", "Type", "Content", "Status"]
+PEER_REPLIES_SHEET = "Cheat Mind Peer Help Replies"
+PEER_REPLIES_HEADERS = ["Reply ID", "Post ID", "Timestamp", "Student Name", "Reply"]
+
+
+def _peer_ws(sheet_title, headers):
+    creds_json_str = gsheet_creds_file.getvalue().decode("utf-8")
+    return get_gsheet_worksheet(creds_json_str, gsheet_url, sheet_title, headers)
+
+
+def fetch_peer_posts():
+    try:
+        ws = _peer_ws(PEER_POSTS_SHEET, PEER_POSTS_HEADERS)
+        return ws.get_all_records()
+    except Exception:
+        return []
+
+
+def create_peer_post(student_name, subject, post_type, content):
+    try:
+        ws = _peer_ws(PEER_POSTS_SHEET, PEER_POSTS_HEADERS)
+        post_id = str(uuid.uuid4())[:8]
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws.append_row([post_id, timestamp, student_name, subject, post_type, content, "Open"])
+        return True, "Posted to the class board!"
+    except Exception as e:
+        return False, f"Couldn't post: {e}"
+
+
+def fetch_replies(post_id):
+    try:
+        ws = _peer_ws(PEER_REPLIES_SHEET, PEER_REPLIES_HEADERS)
+        records = ws.get_all_records()
+        return [r for r in records if str(r.get("Post ID")) == post_id]
+    except Exception:
+        return []
+
+
+def create_reply(post_id, student_name, reply_text):
+    try:
+        ws = _peer_ws(PEER_REPLIES_SHEET, PEER_REPLIES_HEADERS)
+        reply_id = str(uuid.uuid4())[:8]
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws.append_row([reply_id, post_id, timestamp, student_name, reply_text])
+        return True, "Reply posted!"
+    except Exception as e:
+        return False, f"Couldn't reply: {e}"
+
+
+def mark_post_resolved(post_id):
+    try:
+        ws = _peer_ws(PEER_POSTS_SHEET, PEER_POSTS_HEADERS)
+        cell = ws.find(post_id)
+        if cell:
+            ws.update_cell(cell.row, PEER_POSTS_HEADERS.index("Status") + 1, "Resolved")
+        return True
+    except Exception:
+        return False
+
+
+def render_peer_help():
+    """Renders the Peer Help board: a form to post a question or shared
+    piece of work, and a scrollable list of posts with threaded replies."""
+    if not GSHEETS_AVAILABLE or not gsheet_creds_file or not gsheet_url:
+        st.info(
+            "Peer Help needs the same Google Sheets connection as Study Tracking — add a "
+            "service account JSON and Sheet URL in the sidebar. Everyone in your class "
+            "should point to the SAME sheet so posts and replies are actually shared."
+        )
+        return
+
+    st.write("Post a question or share something you're working on — classmates can reply and help.")
+
+    with st.expander("➕ Post a question or share your work", expanded=False):
+        subject = st.selectbox("Subject", list(WASSCE_SUBJECTS.keys()), key="peer_post_subject")
+        post_type = st.radio("Type", ["Question", "Share my work"], horizontal=True, key="peer_post_type")
+        content = st.text_area(
+            "What's on your mind?", key="peer_post_content",
+            placeholder="e.g. Can someone check my essay intro? Or: I'm stuck on this trig identity...",
+        )
+        if st.button("📤 Post to class", key="peer_post_submit"):
+            if not st.session_state.student_name:
+                st.error("Add your name in the sidebar first so classmates know who's asking.")
+            elif not content.strip():
+                st.error("Write something before posting.")
+            else:
+                ok, message = create_peer_post(st.session_state.student_name, subject, post_type, content.strip())
+                if ok:
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.warning(message)
+
+    st.divider()
+    st.markdown("### 📋 Class board")
+    posts = fetch_peer_posts()
+    if not posts:
+        st.info("No posts yet — be the first to ask or share!")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        filter_subject = st.selectbox("Filter by subject", ["All"] + list(WASSCE_SUBJECTS.keys()), key="peer_filter_subject")
+    with col2:
+        show_resolved = st.checkbox("Show resolved posts", value=False, key="peer_show_resolved")
+
+    filtered = posts
+    if filter_subject != "All":
+        filtered = [p for p in filtered if p.get("Subject") == filter_subject]
+    if not show_resolved:
+        filtered = [p for p in filtered if p.get("Status") != "Resolved"]
+    filtered = list(reversed(filtered))  # newest first
+
+    if not filtered:
+        st.caption("No posts match this filter.")
+
+    for post in filtered:
+        post_id = str(post.get("Post ID"))
+        with st.container(border=True):
+            badge = "❓ Question" if post.get("Type") == "Question" else "📝 Shared work"
+            st.markdown(f"**{badge}** · {post.get('Subject', '')} · by {post.get('Student Name', 'Anonymous')}")
+            st.write(post.get("Content", ""))
+            st.caption(f"{post.get('Timestamp', '')} · Status: {post.get('Status', 'Open')}")
+
+            replies = fetch_replies(post_id)
+            if replies:
+                with st.expander(f"💬 {len(replies)} repl{'y' if len(replies) == 1 else 'ies'}"):
+                    for r in replies:
+                        st.markdown(f"**{r.get('Student Name', 'Anonymous')}:** {r.get('Reply', '')}")
+                        st.caption(r.get("Timestamp", ""))
+
+            reply_text = st.text_input("Write a reply", key=f"peer_reply_input_{post_id}")
+            rcol1, rcol2 = st.columns(2)
+            with rcol1:
+                if st.button("💬 Reply", key=f"peer_reply_btn_{post_id}"):
+                    if not st.session_state.student_name:
+                        st.error("Add your name in the sidebar first.")
+                    elif not reply_text.strip():
+                        st.error("Write a reply first.")
+                    else:
+                        ok, message = create_reply(post_id, st.session_state.student_name, reply_text.strip())
+                        if ok:
+                            st.success(message)
+                            st.rerun()
+                        else:
+                            st.warning(message)
+            with rcol2:
+                if post.get("Status") != "Resolved" and st.button("✅ Mark resolved", key=f"peer_resolve_{post_id}"):
+                    if mark_post_resolved(post_id):
+                        st.success("Marked as resolved.")
+                        st.rerun()
 
 
 def play_timer_chime():
@@ -911,7 +1086,7 @@ def render_video_studio():
             )
 
 
-MODES = ["Comfort", "Coding Help", "Study Help", "Sales & Business", "Poetry Help", "General", "Video Studio"]
+MODES = ["Comfort", "Coding Help", "Study Help", "Sales & Business", "Poetry Help", "General", "Peer Help", "Video Studio"]
 
 st.session_state.mode = st.radio(
     "Mode",
@@ -963,77 +1138,15 @@ elif st.session_state.mode == "Study Help":
                 st.success(message)
             else:
                 st.warning(message)
-
-    with st.expander("📝 Practice quiz"):
-        if "current_quiz" not in st.session_state:
-            st.session_state.current_quiz = None
-        if "quiz_answers" not in st.session_state:
-            st.session_state.quiz_answers = {}
-        if "quiz_submitted" not in st.session_state:
-            st.session_state.quiz_submitted = False
-
-        num_q = st.slider("Number of questions", 3, 10, 5, key="quiz_num_q")
-        if st.button("🎲 Generate new quiz"):
-            with st.spinner("Writing quiz questions..."):
-                quiz = generate_quiz(st.session_state.study_subject, num_q)
-            if quiz:
-                st.session_state.current_quiz = quiz
-                st.session_state.quiz_answers = {}
-                st.session_state.quiz_submitted = False
-                st.rerun()
-
-        if st.session_state.current_quiz:
-            st.divider()
-            for i, q in enumerate(st.session_state.current_quiz):
-                options = q.get("options", {})
-                option_keys = list(options.keys())
-                labels = [f"{k.upper()}) {options[k]}" for k in option_keys]
-
-                st.markdown(f"**{i + 1}. {q['question']}**")
-                default_index = None
-                if i in st.session_state.quiz_answers and st.session_state.quiz_answers[i] in option_keys:
-                    default_index = option_keys.index(st.session_state.quiz_answers[i])
-
-                selected = st.radio(
-                    f"question_{i}", labels, key=f"quiz_radio_{i}",
-                    label_visibility="collapsed", index=default_index,
-                    disabled=st.session_state.quiz_submitted,
-                )
-                if selected and not st.session_state.quiz_submitted:
-                    st.session_state.quiz_answers[i] = option_keys[labels.index(selected)]
-
-                if st.session_state.quiz_submitted:
-                    correct_key = q.get("correct", "")
-                    user_key = st.session_state.quiz_answers.get(i)
-                    if user_key == correct_key:
-                        st.success(f"✅ Correct! {q.get('explanation', '')}")
-                    else:
-                        correct_text = options.get(correct_key, "?")
-                        st.error(f"❌ Correct answer: {correct_key.upper()}) {correct_text}. {q.get('explanation', '')}")
-                st.divider()
-
-            if not st.session_state.quiz_submitted:
-                if st.button("✅ Submit answers"):
-                    st.session_state.quiz_submitted = True
-                    st.rerun()
-            else:
-                score = sum(
-                    1 for i, q in enumerate(st.session_state.current_quiz)
-                    if st.session_state.quiz_answers.get(i) == q.get("correct")
-                )
-                total = len(st.session_state.current_quiz)
-                st.markdown(f"### Score: {score}/{total}")
-                if st.button("🔁 Retake / new quiz"):
-                    st.session_state.current_quiz = None
-                    st.session_state.quiz_answers = {}
-                    st.session_state.quiz_submitted = False
-                    st.rerun()
 elif st.session_state.mode == "Sales & Business":
     st.caption("💰 Sales & Business mode — pricing, pitches, finding customers, and growing income.")
 elif st.session_state.mode == "Poetry Help":
     st.caption("✍️ Poetry Help mode — feedback, prompts, and craft tips to help you write your own poems.")
 elif st.session_state.mode == "General":
     st.caption("🌐 General mode — ask about anything.")
+elif st.session_state.mode == "Peer Help":
+    st.caption("🤝 Peer Help — post questions or share your work, and help classmates with theirs.")
+    render_peer_help()
 elif st.session_state.mode == "Video Studio":
     st.caption("🎬 Video Studio — generate short AI video clips from a text prompt (Veo).")
     render_video_studio()
@@ -1081,6 +1194,22 @@ def apply_personalization(instruction: str) -> str:
         extra += "Write your 'reply' field in the same language the user used, unless they ask otherwise. "
 
     return instruction + "\n\n" + extra
+
+
+def call_with_retry(fn, max_retries=3, base_delay=1.5):
+    """Call fn() with exponential backoff retry on transient errors.
+    Re-raises the last exception if all attempts fail, so callers keep their
+    existing error handling.
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    raise last_error
 
 
 def speak(text: str, rate: float = 1.0):
@@ -1247,10 +1376,12 @@ if len(mood_history) >= 2:
             "read of each message — just a rough pattern, not a diagnosis."
         )
 
-for msg in st.session_state.history:
+for idx, msg in enumerate(st.session_state.history):
     avatar = EMOTIONS.get(msg.get("emotion", "neutral"), EMOTIONS["neutral"])["emoji"] if msg["role"] == "assistant" else "🧑"
     with st.chat_message(msg["role"], avatar=avatar):
         st.markdown(msg["content"])
+        if msg["role"] == "assistant":
+            render_feedback_controls(idx, msg)
 
 # Gentle comfort offer if the last message read as sad — never auto-plays, always asks first.
 if st.session_state.history:
