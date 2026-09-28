@@ -16,6 +16,14 @@ Voice notes:
   replies with text + a transcript + an emotion.
 - If "Speak replies aloud" is on, the reply is read out using your
   browser's built-in text-to-speech (no extra audio files generated).
+
+New in this version:
+- Quiz mode      - AI-generated WASSCE-style MCQs, scored, with explanations
+- Progress mode  - accuracy per subject, score history, weak topics
+- Study Plan     - exam countdown + AI day-by-day plan targeting weak topics
+- Fixes          - feedback logs the right reply, Peer Help no longer hits the
+                   Google Sheets rate limit, Chroma rerun crash, photo clears
+                   after sending
 """
 
 import json
@@ -23,8 +31,9 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
+import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 import google.generativeai as genai
@@ -103,6 +112,26 @@ REPLY_LANGUAGES = [
     "Jula (Dyula)",
     "French",
 ]
+
+
+def call_with_retry(fn, max_retries=3, base_delay=1.5):
+    """Call fn() with exponential backoff retry on transient errors.
+    Re-raises the last exception if all attempts fail, so callers keep their
+    existing error handling.
+
+    (Defined here, near the top, because the Quiz / Study Plan modes render
+    before the rest of the helper functions further down the script.)
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    raise last_error
+
 
 SYSTEM_INSTRUCTION = (
     "You are Cheat Mind, a witty, emotionally expressive AI companion capable of hearing "
@@ -232,7 +261,8 @@ def get_subject_collection(subject: str):
     client = chromadb.Client()  # in-memory; rebuilt each app restart
     embed_fn = embedding_functions.DefaultEmbeddingFunction()
     collection_name = "kb_" + re.sub(r"[^a-z0-9]+", "_", subject.lower()).strip("_")
-    collection = client.create_collection(collection_name, embedding_function=embed_fn)
+    # FIX: get_or_create so a cache rebuild / rerun never crashes on "already exists"
+    collection = client.get_or_create_collection(collection_name, embedding_function=embed_fn)
 
     kb_filename = SUBJECT_KB_FILES.get(subject)
     if not kb_filename:
@@ -241,6 +271,9 @@ def get_subject_collection(subject: str):
     kb_path = os.path.join(os.path.dirname(__file__), kb_filename)
     if not os.path.exists(kb_path):
         return collection  # KB file wasn't shipped alongside app.py
+
+    if collection.count() > 0:
+        return collection  # already populated
 
     records = []
     with open(kb_path, "r", encoding="utf-8") as f:
@@ -362,11 +395,14 @@ MODE_INSTRUCTIONS = {
     "Sales & Business": SALES_SYSTEM_INSTRUCTION,
     "General": GENERAL_SYSTEM_INSTRUCTION,
     "Poetry Help": POETRY_SYSTEM_INSTRUCTION,
-    # Peer Help and Video Studio don't use the chat flow as their primary interface,
-    # but fall back to General instructions if someone types a message while
-    # selected, instead of erroring.
+    # Peer Help, Video Studio, Quiz, Progress and Study Plan don't use the chat flow
+    # as their primary interface, but fall back to General instructions if someone
+    # types a message while one is selected, instead of erroring.
     "Peer Help": GENERAL_SYSTEM_INSTRUCTION,
     "Video Studio": GENERAL_SYSTEM_INSTRUCTION,
+    "Quiz": GENERAL_SYSTEM_INSTRUCTION,
+    "Progress": GENERAL_SYSTEM_INSTRUCTION,
+    "Study Plan": GENERAL_SYSTEM_INSTRUCTION,
     # "Study Help" is built dynamically per selected subject — see build_study_instruction()
 }
 
@@ -400,6 +436,12 @@ if "student_name" not in st.session_state:
     st.session_state.student_name = ""
 if "greeted" not in st.session_state:
     st.session_state.greeted = False
+if "quiz_results" not in st.session_state:
+    st.session_state.quiz_results = []
+if "quiz" not in st.session_state:
+    st.session_state.quiz = None
+if "photo_n" not in st.session_state:
+    st.session_state.photo_n = 0
 
 # ----------------------------------------------------------------------
 # Dark mode CSS — injected early so it applies from first paint
@@ -626,20 +668,24 @@ if not st.session_state.onboarding_dismissed:
     with st.container(border=True):
         st.markdown(f"### 👋 Welcome to {st.session_state.companion_name}!")
         st.markdown(
-            "**6 modes, pick with the tabs below:**\n"
+            "**Pick a mode with the tabs below:**\n"
             "- 💙 **Comfort** — an emotionally supportive companion for when things feel heavy\n"
             "- 💻 **Coding Help** — direct, code-first answers to programming questions\n"
-            "- 📚 **Study Help** — WASSCE exam prep across 12 subjects, with quizzes, essay/answer "
-            "feedback, and reference-grounded answers for 11 of them\n"
+            "- 📚 **Study Help** — WASSCE exam prep across 12 subjects, with explanations, "
+            "essay/answer feedback, and reference-grounded answers for 11 of them\n"
+            "- 📝 **Quiz** — scored WASSCE-style multiple-choice quizzes with explanations\n"
+            "- 📈 **Progress** — your quiz scores, history, and weak topics\n"
+            "- 🗓️ **Study Plan** — exam countdown and a day-by-day plan built around your weak topics\n"
             "- 💰 **Sales & Business** — pricing, pitches, finding customers, growing income\n"
             "- ✍️ **Poetry Help** — feedback and craft tips to help you write your own poems\n"
             "- 🤝 **Peer Help** — post questions or share your work; classmates can reply and help each other\n"
+            "- 🎬 **Video Studio** — generate short AI video clips (paid Google tier needed)\n"
             "- 🌐 **General** — anything else\n\n"
             "**Talk to it however's easiest:** type, hit the mic to talk live, attach a photo "
             "(a textbook page, a product, anything), or send an emoji.\n\n"
             "**In Study Help**, there's also a ⏱️ built-in study timer and optional Google Sheets "
             "logging for tracking sessions.\n\n"
-            "**In the sidebar** you can rename your companion, set its tone, pick a reply "
+            "**In the sidebar** you can set its tone, pick a reply "
             "language (English, Wolof, Mandinka, Fula, and more), switch to 🌙 dark mode, and "
             "export or reload past conversations. You can also 👍/👎 any of my replies — that "
             "feedback gets logged so problems can be spotted and fixed over time."
@@ -697,6 +743,35 @@ def log_study_session(minutes_studied, note=""):
 
 
 # ----------------------------------------------------------------------
+# Quiz results log — one row per finished quiz, if Google Sheets is connected
+# ----------------------------------------------------------------------
+
+QUIZ_SHEET_NAME = "Cheat Mind Quiz Log"
+QUIZ_HEADERS = ["Timestamp", "Student Name", "Subject", "Difficulty", "Correct", "Total", "Missed Topics"]
+
+
+def log_quiz_result(record: dict):
+    """Silently appends a finished quiz to Google Sheets. Never blocks the quiz
+    if Sheets isn't configured or the write fails."""
+    if not GSHEETS_AVAILABLE or not gsheet_creds_file or not gsheet_url:
+        return
+    try:
+        creds_json_str = gsheet_creds_file.getvalue().decode("utf-8")
+        ws = get_gsheet_worksheet(creds_json_str, gsheet_url, QUIZ_SHEET_NAME, QUIZ_HEADERS)
+        ws.append_row([
+            record["timestamp"],
+            st.session_state.student_name,
+            record["subject"],
+            record["difficulty"],
+            record["correct"],
+            record["total"],
+            ", ".join(sorted(set(record["missed_topics"]))),
+        ])
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------
 # Feedback loop — 👍/👎 on assistant replies, logged to Google Sheets
 # ----------------------------------------------------------------------
 
@@ -704,18 +779,22 @@ FEEDBACK_SHEET_NAME = "Cheat Mind Feedback Log"
 FEEDBACK_HEADERS = ["Timestamp", "Mode", "Subject", "AI Reply Snippet", "Rating", "Comment"]
 
 
-def log_feedback(rating: str, comment: str = ""):
-    """Logs a 👍/👎 on the most recent assistant reply to Google Sheets, if
+def log_feedback(rating: str, comment: str = "", reply_text: str = ""):
+    """Logs a 👍/👎 on a specific assistant reply to Google Sheets, if
     configured. This is the feedback loop — over time it shows which modes or
-    subjects are landing well and which need a prompt or content fix."""
+    subjects are landing well and which need a prompt or content fix.
+
+    FIX: logs the reply the user actually clicked on (reply_text), not just
+    whichever assistant message happened to be last in the chat."""
     if not GSHEETS_AVAILABLE or not gsheet_creds_file or not gsheet_url:
         return False, "Feedback needs the Google Sheets connection configured in the sidebar."
     try:
         creds_json_str = gsheet_creds_file.getvalue().decode("utf-8")
         ws = get_gsheet_worksheet(creds_json_str, gsheet_url, FEEDBACK_SHEET_NAME, FEEDBACK_HEADERS)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        last_reply = next((m["content"] for m in reversed(st.session_state.history) if m["role"] == "assistant"), "")
-        snippet = (last_reply[:120] + "...") if len(last_reply) > 120 else last_reply
+        if not reply_text:
+            reply_text = next((m["content"] for m in reversed(st.session_state.history) if m["role"] == "assistant"), "")
+        snippet = (reply_text[:120] + "...") if len(reply_text) > 120 else reply_text
         subject = st.session_state.study_subject if st.session_state.mode == "Study Help" else ""
         ws.append_row([timestamp, st.session_state.mode, subject, snippet, rating, comment])
         return True, "Feedback logged."
@@ -736,7 +815,7 @@ def render_feedback_controls(idx: int, msg: dict):
     with col1:
         if st.button("👍", key=f"fb_up_{idx}"):
             msg["feedback"] = "up"
-            log_feedback("👍")
+            log_feedback("👍", reply_text=msg["content"])
             st.rerun()
     with col2:
         if st.button("👎", key=f"fb_down_{idx}"):
@@ -747,7 +826,7 @@ def render_feedback_controls(idx: int, msg: dict):
         comment = st.text_input("What was off about this reply? (optional)", key=f"fb_comment_input_{idx}")
         if st.button("Submit feedback", key=f"fb_comment_submit_{idx}"):
             msg["feedback"] = "down"
-            log_feedback("👎", comment)
+            log_feedback("👎", comment, reply_text=msg["content"])
             st.session_state[f"show_fb_comment_{idx}"] = False
             st.rerun()
 
@@ -773,10 +852,19 @@ def _peer_ws(sheet_title, headers):
     return get_gsheet_worksheet(creds_json_str, gsheet_url, sheet_title, headers)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_records(creds_json_str, sheet_ref, title, headers):
+    """FIX: one Google Sheets read per sheet per 30 seconds, instead of one
+    read per post on every rerun (which hit Sheets' ~60 reads/minute quota).
+    Cleared right after any write so new posts/replies show up immediately."""
+    ws = get_gsheet_worksheet(creds_json_str, sheet_ref, title, list(headers))
+    return ws.get_all_records()
+
+
 def fetch_peer_posts():
     try:
-        ws = _peer_ws(PEER_POSTS_SHEET, PEER_POSTS_HEADERS)
-        return ws.get_all_records()
+        creds_json_str = gsheet_creds_file.getvalue().decode("utf-8")
+        return _cached_records(creds_json_str, gsheet_url, PEER_POSTS_SHEET, tuple(PEER_POSTS_HEADERS))
     except Exception:
         return []
 
@@ -787,6 +875,7 @@ def create_peer_post(student_name, subject, post_type, content):
         post_id = str(uuid.uuid4())[:8]
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ws.append_row([post_id, timestamp, student_name, subject, post_type, content, "Open"])
+        _cached_records.clear()
         return True, "Posted to the class board!"
     except Exception as e:
         return False, f"Couldn't post: {e}"
@@ -794,8 +883,8 @@ def create_peer_post(student_name, subject, post_type, content):
 
 def fetch_replies(post_id):
     try:
-        ws = _peer_ws(PEER_REPLIES_SHEET, PEER_REPLIES_HEADERS)
-        records = ws.get_all_records()
+        creds_json_str = gsheet_creds_file.getvalue().decode("utf-8")
+        records = _cached_records(creds_json_str, gsheet_url, PEER_REPLIES_SHEET, tuple(PEER_REPLIES_HEADERS))
         return [r for r in records if str(r.get("Post ID")) == post_id]
     except Exception:
         return []
@@ -807,6 +896,7 @@ def create_reply(post_id, student_name, reply_text):
         reply_id = str(uuid.uuid4())[:8]
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ws.append_row([reply_id, post_id, timestamp, student_name, reply_text])
+        _cached_records.clear()
         return True, "Reply posted!"
     except Exception as e:
         return False, f"Couldn't reply: {e}"
@@ -818,6 +908,7 @@ def mark_post_resolved(post_id):
         cell = ws.find(post_id)
         if cell:
             ws.update_cell(cell.row, PEER_POSTS_HEADERS.index("Status") + 1, "Resolved")
+        _cached_records.clear()
         return True
     except Exception:
         return False
@@ -1085,8 +1176,294 @@ def render_video_studio():
                 "signatures), or the prompt was rejected by content filters."
             )
 
+# ----------------------------------------------------------------------
+# NEW: Quiz mode, Progress dashboard, Study Plan
+# ----------------------------------------------------------------------
 
-MODES = ["Comfort", "Coding Help", "Study Help", "Sales & Business", "Poetry Help", "General", "Peer Help", "Video Studio"]
+def parse_json(text: str):
+    """Extract the first JSON array/object from a model response."""
+    text = text.strip()
+    text = re.sub(r"^```(json)?", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
+    starts = [i for i in (text.find("["), text.find("{")) if i != -1]
+    if not starts:
+        raise ValueError("No JSON found in model response.")
+    start = min(starts)
+    end = max(text.rfind("]"), text.rfind("}")) + 1
+    return json.loads(text[start:end])
+
+
+def validate_questions(raw) -> list:
+    """Keep only well-formed MCQs: 4 distinct options, answer index 0-3."""
+    if isinstance(raw, dict):
+        raw = raw.get("questions", [])
+    good = []
+    for q in raw if isinstance(raw, list) else []:
+        try:
+            options = [str(o).strip() for o in q["options"]]
+            answer = int(q["answer"])
+            if len(options) == 4 and len(set(options)) == 4 and 0 <= answer <= 3 and q["question"].strip():
+                good.append({
+                    "question": q["question"].strip(),
+                    "options": options,
+                    "answer": answer,
+                    "explanation": str(q.get("explanation", "")).strip(),
+                    "topic": str(q.get("topic", "General")).strip() or "General",
+                })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return good
+
+
+def score_quiz(questions: list, picked: list) -> dict:
+    """picked[i] is the chosen option text (or None). Returns score + per-topic misses."""
+    correct = 0
+    missed_topics = []
+    detail = []
+    for q, choice in zip(questions, picked):
+        right_text = q["options"][q["answer"]]
+        is_right = choice == right_text
+        if is_right:
+            correct += 1
+        else:
+            missed_topics.append(q["topic"])
+        detail.append({"picked": choice, "correct": right_text, "is_right": is_right})
+    return {"correct": correct, "total": len(questions), "missed_topics": missed_topics, "detail": detail}
+
+
+def _generate(prompt, as_json=True):
+    """One-shot Gemini call (no chat history) for quizzes and plans."""
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name=model_name)
+    if as_json:
+        result = call_with_retry(
+            lambda: model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+        )
+    else:
+        result = call_with_retry(lambda: model.generate_content(prompt))
+    return result.text
+
+
+def _weak_topics(subject=None, top=5) -> list:
+    counts = {}
+    for r in st.session_state.quiz_results:
+        if subject and r["subject"] != subject:
+            continue
+        for t in r["missed_topics"]:
+            counts[t] = counts.get(t, 0) + 1
+    return [t for t, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:top]]
+
+
+def render_quiz_mode():
+    st.write("Test yourself with WASSCE-style questions. You get a score, the right answers, and explanations.")
+
+    c1, c2, c3 = st.columns(3)
+    subject = c1.selectbox("Subject", list(WASSCE_SUBJECTS.keys()), key="quiz_subject")
+    n_questions = c2.selectbox("Questions", [5, 10, 15], index=0, key="quiz_n")
+    difficulty = c3.selectbox("Difficulty", ["Easy", "Medium", "Hard"], index=1, key="quiz_diff")
+
+    weak = _weak_topics(subject)
+    focus_weak = False
+    if weak:
+        focus_weak = st.checkbox(f"Focus on my weak topics ({', '.join(weak[:3])})", key="quiz_focus_weak")
+
+    if st.button("Generate quiz", type="primary", key="quiz_generate"):
+        if not api_key:
+            st.error("Add your Gemini API key in the sidebar first.")
+            return
+        lang = "English" if st.session_state.reply_language.startswith("Auto") else st.session_state.reply_language
+        grounding = retrieve_subject_context(subject, f"{subject} exam questions", k=3) if subject in SUBJECT_KB_FILES else ""
+        prompt = (
+            f"Write {n_questions} multiple-choice questions in WASSCE exam style for {subject} "
+            f"({WASSCE_SUBJECTS[subject]}). Difficulty: {difficulty}. Write in {lang}. "
+            + (f"Concentrate on these topics the student is weak in: {', '.join(weak[:3])}. " if focus_weak else "")
+            + (f"You may base some questions on these reference passages:\n{grounding}\n" if grounding else "")
+            + "Each question must have exactly 4 distinct options and exactly one correct answer. "
+            "Only include questions you are certain are factually correct. "
+            "Return ONLY a JSON array. Each item: "
+            '{"question": "...", "options": ["...", "...", "...", "..."], '
+            '"answer": <index 0-3 of correct option>, "explanation": "one or two sentences", '
+            '"topic": "short topic name"}. Do not put letters like A) in the options.'
+        )
+        try:
+            with st.spinner("Writing your quiz..."):
+                raw = parse_json(_generate(prompt))
+            questions = validate_questions(raw)
+            if not questions:
+                st.error("The model returned no usable questions. Try again.")
+                return
+            st.session_state.quiz = {
+                "id": datetime.now().strftime("%H%M%S%f"),
+                "subject": subject,
+                "difficulty": difficulty,
+                "questions": questions,
+                "result": None,
+            }
+            st.rerun()
+        except Exception as e:
+            st.error(f"Couldn't generate the quiz: {e}")
+            return
+
+    quiz = st.session_state.quiz
+    if not quiz:
+        return
+
+    st.divider()
+    st.markdown(f"### {quiz['subject']} quiz ({quiz['difficulty']})")
+
+    if quiz["result"] is None:
+        with st.form(f"quiz_form_{quiz['id']}"):
+            for i, q in enumerate(quiz["questions"]):
+                st.markdown(f"**{i + 1}. {q['question']}**")
+                st.radio("Answer", q["options"], index=None,
+                         key=f"quiz_{quiz['id']}_{i}", label_visibility="collapsed")
+            submitted = st.form_submit_button("Submit answers")
+        if submitted:
+            picked = [st.session_state.get(f"quiz_{quiz['id']}_{i}") for i in range(len(quiz["questions"]))]
+            result = score_quiz(quiz["questions"], picked)
+            quiz["result"] = result
+            record = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "subject": quiz["subject"],
+                "difficulty": quiz["difficulty"],
+                "correct": result["correct"],
+                "total": result["total"],
+                "missed_topics": result["missed_topics"],
+            }
+            st.session_state.quiz_results.append(record)
+            log_quiz_result(record)
+            st.rerun()
+        return
+
+    # Review screen
+    result = quiz["result"]
+    pct = round(100 * result["correct"] / result["total"])
+    st.metric("Score", f"{result['correct']} / {result['total']}", f"{pct}%")
+    if pct >= 80:
+        st.success("Strong result. Try a Hard quiz next.")
+    elif pct >= 50:
+        st.info("Decent. Review the misses below, then retry.")
+    else:
+        st.warning("This topic needs more work. Read the explanations, then try an Easy quiz on the same subject.")
+
+    for i, (q, d) in enumerate(zip(quiz["questions"], result["detail"])):
+        with st.container(border=True):
+            st.markdown(f"**{i + 1}. {q['question']}**")
+            if d["is_right"]:
+                st.success(f"Correct: {d['correct']}")
+            else:
+                st.error(f"Your answer: {d['picked'] or 'No answer'}")
+                st.success(f"Correct answer: {d['correct']}")
+            if q["explanation"]:
+                st.caption(f"{q['explanation']}  (Topic: {q['topic']})")
+
+    if st.button("New quiz", key="quiz_reset"):
+        st.session_state.quiz = None
+        st.rerun()
+
+
+def render_progress_dashboard():
+    results = st.session_state.quiz_results
+
+    with st.expander("Save / load your quiz results"):
+        if results:
+            st.download_button("Download results (.json)", json.dumps(results, indent=2),
+                               file_name="cheat_mind_quiz_results.json", mime="application/json")
+        up = st.file_uploader("Load saved results", type=["json"], key="quiz_results_upload")
+        if up is not None:
+            try:
+                loaded = json.loads(up.read().decode("utf-8"))
+                if isinstance(loaded, list) and all("subject" in r and "correct" in r for r in loaded):
+                    st.session_state.quiz_results = loaded
+                    st.success("Results loaded.")
+                    st.rerun()
+                else:
+                    st.error("That doesn't look like a Cheat Mind results file.")
+            except Exception as e:
+                st.error(f"Couldn't load that file: {e}")
+
+    if not results:
+        st.info("No quiz results yet. Take a quiz in Quiz mode and your progress will show up here.")
+        return
+
+    df = pd.DataFrame(results)
+    df["percent"] = (100 * df["correct"] / df["total"]).round(1)
+
+    total_q = int(df["total"].sum())
+    total_c = int(df["correct"].sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Quizzes taken", len(df))
+    c2.metric("Questions answered", total_q)
+    c3.metric("Overall accuracy", f"{round(100 * total_c / total_q)}%")
+
+    st.markdown("#### Average score by subject")
+    st.bar_chart(df.groupby("subject")["percent"].mean().round(1))
+
+    st.markdown("#### Score over time")
+    st.line_chart(df.reset_index()[["index", "percent"]].set_index("index"))
+
+    weak = _weak_topics()
+    if weak:
+        st.markdown("#### Topics to revise")
+        st.write(", ".join(weak))
+        st.caption("These are the topics you missed most often. Tick 'Focus on my weak topics' in Quiz mode to drill them.")
+
+
+def render_study_planner():
+    st.write("Set your exam date and get a day-by-day plan that puts extra time on your weak topics.")
+
+    exam_date = st.date_input("First exam date", value=st.session_state.get("exam_date"),
+                              min_value=date.today(), key="planner_exam_date")
+    days_left = None
+    if exam_date:
+        st.session_state.exam_date = exam_date
+        days_left = (exam_date - date.today()).days
+        st.metric("Days until exam", days_left)
+
+    chosen = st.multiselect("Subjects to cover", list(WASSCE_SUBJECTS.keys()), key="planner_subjects")
+    hours = st.slider("Study hours per day", 1, 8, 2, key="planner_hours")
+    extra = st.text_input("Anything else? (e.g. 'I work in the afternoons')", key="planner_extra")
+
+    if st.button("Build my plan", type="primary", key="planner_go"):
+        if not api_key:
+            st.error("Add your Gemini API key in the sidebar first.")
+            return
+        if not exam_date or not chosen:
+            st.error("Pick an exam date and at least one subject.")
+            return
+        weak_lines = []
+        for s in chosen:
+            w = _weak_topics(s)
+            if w:
+                weak_lines.append(f"{s}: {', '.join(w)}")
+        horizon = min(days_left, 28) if days_left > 0 else 1
+        prompt = (
+            f"Create a realistic WASSCE study plan for a student. Exam starts in {days_left} days. "
+            f"Subjects: {', '.join(chosen)}. Study time: {hours} hours per day. "
+            + (f"Weak topics that need extra time: {'; '.join(weak_lines)}. " if weak_lines else "")
+            + (f"Note from the student: {extra}. " if extra else "")
+            + f"Plan the next {horizon} days, one line per day (Day 1, Day 2, ...), each naming the "
+            "subject, the specific topic, and the activity (learn, practice questions, or past paper). "
+            "Include one lighter review day per week and a final revision block before the exam. "
+            "Use plain markdown. No preamble."
+        )
+        try:
+            with st.spinner("Building your plan..."):
+                st.session_state.study_plan = _generate(prompt, as_json=False)
+        except Exception as e:
+            st.error(f"Couldn't build the plan: {e}")
+
+    plan = st.session_state.get("study_plan")
+    if plan:
+        st.divider()
+        st.markdown(plan)
+        st.download_button("Download plan (.txt)", plan, file_name="cheat_mind_study_plan.txt", mime="text/plain")
+
+
+MODES = [
+    "Comfort", "Coding Help", "Study Help", "Quiz", "Progress", "Study Plan",
+    "Sales & Business", "Poetry Help", "General", "Peer Help", "Video Studio",
+]
 
 st.session_state.mode = st.radio(
     "Mode",
@@ -1138,6 +1515,15 @@ elif st.session_state.mode == "Study Help":
                 st.success(message)
             else:
                 st.warning(message)
+elif st.session_state.mode == "Quiz":
+    st.caption("📝 Quiz mode — test yourself and get scored.")
+    render_quiz_mode()
+elif st.session_state.mode == "Progress":
+    st.caption("📈 Progress — your quiz history and weak topics.")
+    render_progress_dashboard()
+elif st.session_state.mode == "Study Plan":
+    st.caption("🗓️ Study Plan — exam countdown and a personal day-by-day plan.")
+    render_study_planner()
 elif st.session_state.mode == "Sales & Business":
     st.caption("💰 Sales & Business mode — pricing, pitches, finding customers, and growing income.")
 elif st.session_state.mode == "Poetry Help":
@@ -1196,22 +1582,6 @@ def apply_personalization(instruction: str) -> str:
     return instruction + "\n\n" + extra
 
 
-def call_with_retry(fn, max_retries=3, base_delay=1.5):
-    """Call fn() with exponential backoff retry on transient errors.
-    Re-raises the last exception if all attempts fail, so callers keep their
-    existing error handling.
-    """
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            return fn()
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                time.sleep(base_delay * (2 ** attempt))
-    raise last_error
-
-
 def speak(text: str, rate: float = 1.0):
     """Read text aloud in the browser via the Web Speech API."""
     safe_text = json.dumps(text)
@@ -1241,7 +1611,8 @@ def get_response(parts):
                 grounding_context = retrieve_subject_context(st.session_state.study_subject, query_text)
         instruction = build_study_instruction(st.session_state.study_subject, grounding_context)
     else:
-        instruction = MODE_INSTRUCTIONS[st.session_state.mode]
+        # FIX: .get() with a General fallback so no mode can ever KeyError here
+        instruction = MODE_INSTRUCTIONS.get(st.session_state.mode, GENERAL_SYSTEM_INSTRUCTION)
     instruction = apply_personalization(instruction)
     model = genai.GenerativeModel(
         model_name=model_name,
@@ -1425,10 +1796,12 @@ with col_mic:
     )
 
 with col_photo:
+    # FIX: the key includes a counter that is bumped after each send, so the
+    # uploader (and caption box) reset instead of keeping the old photo attached.
     photo = st.file_uploader(
         "Attach a photo",
         type=list(IMAGE_MIME_MAP.keys()),
-        key="cheat_mind_photo",
+        key=f"cheat_mind_photo_{st.session_state.photo_n}",
         label_visibility="collapsed",
     )
 
@@ -1447,7 +1820,7 @@ if photo is not None:
     st.image(photo, caption="Attached photo", width=200)
     photo_caption = st.text_input(
         "Say something about the photo (optional)",
-        key="cheat_mind_photo_caption",
+        key=f"cheat_mind_photo_caption_{st.session_state.photo_n}",
         placeholder="e.g. Can you help me with this question?",
     )
     if st.button("📤 Send photo", key="send_photo_btn"):
@@ -1456,6 +1829,8 @@ if photo is not None:
         image_part = {"mime_type": mime_type, "data": photo.getvalue()}
         prompt_text = photo_caption.strip() or "Look at this photo and help me with it."
         fallback_text = f"[Photo attached] {photo_caption.strip()}" if photo_caption.strip() else "[Photo attached]"
+        if api_key:
+            st.session_state.photo_n += 1  # clears the uploader + caption on the next run
         handle_turn([image_part, prompt_text], fallback_user_text=fallback_text)
 
 # ----------------------------------------------------------------------
