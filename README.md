@@ -41,7 +41,7 @@ Thousands of students in The Gambia sit the WASSCE with no tutor, no study plan 
 - 🌙 Dark mode, and chat export/import
 
 ## How it works
-
+https://github.com/bahsulayman689-hash/emotion_ai_agent/blob/main/cheat_mind_app_workflow.png
 ```mermaid
 flowchart TD
     A[Student input: voice, text, photo, emoji] --> B[Mode selector: 11 modes]
