@@ -6,9 +6,14 @@ Run:
     pip install -r requirements.txt
     streamlit run cheat_mind_app.py
 
-You'll need a Gemini API key from https://aistudio.google.com/app/apikey
-Paste it into the sidebar when the app opens (it's kept only in your
-session, never written to disk or sent anywhere else).
+API keys (secure setup):
+- On Streamlit Cloud: App -> Settings -> Secrets, add GEMINI_API_KEY
+  (and optionally GSHEET_URL and GCP_SERVICE_ACCOUNT).
+- Locally: put the same lines in .streamlit/secrets.toml and add that file
+  to .gitignore. NEVER commit keys to GitHub.
+- If no secret is set, the sidebar shows a box where a user can paste their
+  own Gemini key (kept only in their session).
+Get a key at https://aistudio.google.com/app/apikey
 
 Voice notes:
 - Click the mic button, speak, click it again to stop. Your voice clip is
@@ -17,13 +22,11 @@ Voice notes:
 - If "Speak replies aloud" is on, the reply is read out using your
   browser's built-in text-to-speech (no extra audio files generated).
 
-New in this version:
+Features:
 - Quiz mode      - AI-generated WASSCE-style MCQs, scored, with explanations
 - Progress mode  - accuracy per subject, score history, weak topics
 - Study Plan     - exam countdown + AI day-by-day plan targeting weak topics
-- Fixes          - feedback logs the right reply, Peer Help no longer hits the
-                   Google Sheets rate limit, Chroma rerun crash, photo clears
-                   after sending
+- Video Studio   - always uses the student's OWN paid key, never the shared one
 """
 
 import json
@@ -261,7 +264,7 @@ def get_subject_collection(subject: str):
     client = chromadb.Client()  # in-memory; rebuilt each app restart
     embed_fn = embedding_functions.DefaultEmbeddingFunction()
     collection_name = "kb_" + re.sub(r"[^a-z0-9]+", "_", subject.lower()).strip("_")
-    # FIX: get_or_create so a cache rebuild / rerun never crashes on "already exists"
+    # get_or_create so a cache rebuild / rerun never crashes on "already exists"
     collection = client.get_or_create_collection(collection_name, embedding_function=embed_fn)
 
     kb_filename = SUBJECT_KB_FILES.get(subject)
@@ -506,15 +509,42 @@ def build_export_txt():
         lines.append(f"{speaker}: {m['content']}")
     return "\n\n".join(lines)
 
+
+# ----------------------------------------------------------------------
+# Secrets helpers — keys live in Streamlit secrets, never in the code
+# ----------------------------------------------------------------------
+
+def get_secret(name, default=""):
+    """Read from Streamlit secrets (Cloud or .streamlit/secrets.toml), then env vars."""
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.environ.get(name, default)
+
+
+class _SecretFile:
+    """Makes a secret string behave like the uploaded file your Sheets code expects."""
+    def __init__(self, text):
+        self._text = text
+
+    def getvalue(self):
+        return self._text.encode("utf-8")
+
+
 # ----------------------------------------------------------------------
 # Sidebar — API key + model + voice settings
 # ----------------------------------------------------------------------
 
 with st.sidebar:
     st.header("⚙️ Setup")
-    api_key = st.text_input("Gemini API key", type="password", help="Get one free at aistudio.google.com/app/apikey")
+    secret_key = get_secret("GEMINI_API_KEY")
+    if secret_key:
+        api_key = secret_key
+        st.success("API key loaded securely 🔒")
+    else:
+        api_key = st.text_input("Gemini API key", type="password", help="Get one free at aistudio.google.com/app/apikey")
+        st.caption("Your key stays in this browser session only.")
     model_name = st.text_input("Model", value="gemini-3.6-flash", help="Change if you want a different Gemini model")
-    st.caption("Your key stays in this browser session only.")
 
     st.divider()
     st.header("🧑‍🎨 Personalize")
@@ -543,14 +573,23 @@ with st.sidebar:
         gsheet_creds_file = None
         gsheet_url = ""
     else:
-        gsheet_creds_file = st.file_uploader(
-            "Google service account JSON", type=["json"], key="gsheet_creds"
-        )
-        gsheet_url = st.text_input("Google Sheet URL or ID", key="gsheet_url")
-        st.caption(
-            "Share the sheet with your service account's email (inside the JSON file) "
-            "as an Editor first, then paste the sheet's URL here."
-        )
+        secret_creds = get_secret("GCP_SERVICE_ACCOUNT")
+        secret_sheet = get_secret("GSHEET_URL")
+        if secret_creds and secret_sheet:
+            if not isinstance(secret_creds, str):  # if stored as a TOML table
+                secret_creds = json.dumps(dict(secret_creds))
+            gsheet_creds_file = _SecretFile(secret_creds)
+            gsheet_url = secret_sheet
+            st.success("Google Sheets connected 🔒")
+        else:
+            gsheet_creds_file = st.file_uploader(
+                "Google service account JSON", type=["json"], key="gsheet_creds"
+            )
+            gsheet_url = st.text_input("Google Sheet URL or ID", key="gsheet_url")
+            st.caption(
+                "Share the sheet with your service account's email (inside the JSON file) "
+                "as an Editor first, then paste the sheet's URL here."
+            )
 
     st.divider()
     st.header("🔊 Voice")
@@ -679,7 +718,7 @@ if not st.session_state.onboarding_dismissed:
             "- 💰 **Sales & Business** — pricing, pitches, finding customers, growing income\n"
             "- ✍️ **Poetry Help** — feedback and craft tips to help you write your own poems\n"
             "- 🤝 **Peer Help** — post questions or share your work; classmates can reply and help each other\n"
-            "- 🎬 **Video Studio** — generate short AI video clips (paid Google tier needed)\n"
+            "- 🎬 **Video Studio** — generate short AI video clips (you bring your own paid Gemini key)\n"
             "- 🌐 **General** — anything else\n\n"
             "**Talk to it however's easiest:** type, hit the mic to talk live, attach a photo "
             "(a textbook page, a product, anything), or send an emoji.\n\n"
@@ -693,6 +732,7 @@ if not st.session_state.onboarding_dismissed:
         if st.button("Got it, let's start! 🚀"):
             st.session_state.onboarding_dismissed = True
             st.rerun()
+
 
 @st.cache_resource(show_spinner=False)
 def get_gsheet_worksheet(creds_json_str, sheet_ref, worksheet_title="Cheat Mind Study Log", headers=None):
@@ -784,7 +824,7 @@ def log_feedback(rating: str, comment: str = "", reply_text: str = ""):
     configured. This is the feedback loop — over time it shows which modes or
     subjects are landing well and which need a prompt or content fix.
 
-    FIX: logs the reply the user actually clicked on (reply_text), not just
+    Logs the reply the user actually clicked on (reply_text), not just
     whichever assistant message happened to be last in the chat."""
     if not GSHEETS_AVAILABLE or not gsheet_creds_file or not gsheet_url:
         return False, "Feedback needs the Google Sheets connection configured in the sidebar."
@@ -854,7 +894,7 @@ def _peer_ws(sheet_title, headers):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_records(creds_json_str, sheet_ref, title, headers):
-    """FIX: one Google Sheets read per sheet per 30 seconds, instead of one
+    """One Google Sheets read per sheet per 30 seconds, instead of one
     read per post on every rerun (which hit Sheets' ~60 reads/minute quota).
     Cleared right after any write so new posts/replies show up immediately."""
     ws = get_gsheet_worksheet(creds_json_str, sheet_ref, title, list(headers))
@@ -1107,7 +1147,7 @@ VEO_COST_PER_SECOND = {
 
 
 def render_video_studio():
-    """Renders the Video Studio UI: prompt, duration, cost estimate, and generation."""
+    """Video Studio: always uses the student's OWN paid Gemini key, never the app's shared key."""
     if not VEO_AVAILABLE:
         st.warning(
             "Video generation needs the `google-genai` package (a different package from "
@@ -1118,11 +1158,19 @@ def render_video_studio():
 
     with st.container(border=True):
         st.markdown(
-            "⚠️ **This costs real money — there is no free tier for video generation.** "
-            "You need a Gemini API key with billing/a paid tier enabled (a different "
-            "requirement than the free key used for chat). You are only charged if a "
-            "video successfully generates."
+            "⚠️ **This costs real money. There is no free tier for video generation.** "
+            "Video Studio does NOT use the app's shared key. Paste your own Gemini API key "
+            "below, from a Google account with billing enabled. You are only charged if a "
+            "video successfully generates, and the charge goes to YOUR Google Cloud account."
         )
+
+    video_key = st.text_input(
+        "Your own Gemini API key (paid tier)",
+        type="password",
+        key="video_studio_key",
+        help="Get one at aistudio.google.com/app/apikey and enable billing on it. "
+             "This key is kept only in your browser session.",
+    )
 
     video_model_label = st.selectbox("Model", list(VEO_MODELS.keys()))
     video_model = VEO_MODELS[video_model_label]
@@ -1135,17 +1183,18 @@ def render_video_studio():
     duration = st.selectbox("Duration (seconds)", [4, 6, 8], index=2)
 
     est_cost = VEO_COST_PER_SECOND.get(video_model, 0.4) * duration
-    st.caption(f"💵 Estimated cost: **~${est_cost:.2f}** for this {duration}-second clip (ballpark — check your Google Cloud billing for the real charge).")
+    st.caption(
+        f"💵 Estimated cost: **~${est_cost:.2f}** for this {duration}-second clip "
+        "(ballpark. Check your Google Cloud billing for the real charge)."
+    )
 
-    confirmed = st.checkbox("I understand this will charge my Google Cloud billing account.")
+    confirmed = st.checkbox("I understand this will charge MY Google Cloud billing account.")
 
-    if st.button("🎬 Generate video", disabled=not (video_prompt and confirmed)):
-        if not api_key:
-            st.error("Add your Gemini API key in the sidebar first.")
-            return
+    can_generate = bool(video_key and video_prompt and confirmed)
+    if st.button("🎬 Generate video", disabled=not can_generate):
         try:
-            client = veo_genai.Client(api_key=api_key)
-            with st.spinner("Generating video — this typically takes 1-3 minutes..."):
+            client = veo_genai.Client(api_key=video_key)
+            with st.spinner("Generating video. This typically takes 1-3 minutes..."):
                 operation = client.models.generate_videos(
                     model=video_model,
                     prompt=video_prompt,
@@ -1159,25 +1208,36 @@ def render_video_studio():
                     operation = client.operations.get(operation)
 
             generated = operation.response.generated_videos[0]
-            out_path = os.path.join(os.getcwd(), "cheat_mind_generated_video.mp4")
+            # unique filename per request so two students never overwrite each other's video
+            out_path = os.path.join(os.getcwd(), f"cheat_mind_video_{uuid.uuid4().hex[:8]}.mp4")
             client.files.download(file=generated.video)
             generated.video.save(out_path)
 
-            st.success("Video generated!")
-            st.video(out_path)
             with open(out_path, "rb") as f:
-                st.download_button("⬇️ Download video", f, file_name="cheat_mind_video.mp4", mime="video/mp4")
+                video_bytes = f.read()
+            try:
+                os.remove(out_path)  # don't leave files piling up on the server
+            except OSError:
+                pass
+
+            st.success("Video generated!")
+            st.video(video_bytes)
+            st.download_button(
+                "⬇️ Download video", video_bytes,
+                file_name="cheat_mind_video.mp4", mime="video/mp4",
+            )
         except Exception as e:
             st.error(
                 f"Video generation failed: {e}\n\n"
-                "Common causes: the API key isn't on a paid/billed tier, the `google-genai` "
-                "SDK version is out of date (Veo's API surface has changed across versions — "
-                "check https://ai.google.dev/gemini-api/docs/video for the current method "
+                "Common causes: your key isn't on a paid/billed tier, the `google-genai` "
+                "SDK version is out of date (Veo's API has changed across versions, so check "
+                "https://ai.google.dev/gemini-api/docs/video for the current method "
                 "signatures), or the prompt was rejected by content filters."
             )
 
+
 # ----------------------------------------------------------------------
-# NEW: Quiz mode, Progress dashboard, Study Plan
+# Quiz mode, Progress dashboard, Study Plan
 # ----------------------------------------------------------------------
 
 def parse_json(text: str):
@@ -1534,7 +1594,7 @@ elif st.session_state.mode == "Peer Help":
     st.caption("🤝 Peer Help — post questions or share your work, and help classmates with theirs.")
     render_peer_help()
 elif st.session_state.mode == "Video Studio":
-    st.caption("🎬 Video Studio — generate short AI video clips from a text prompt (Veo).")
+    st.caption("🎬 Video Studio — generate short AI video clips from a text prompt (Veo). Uses your own paid key.")
     render_video_studio()
 
 # ----------------------------------------------------------------------
@@ -1611,7 +1671,7 @@ def get_response(parts):
                 grounding_context = retrieve_subject_context(st.session_state.study_subject, query_text)
         instruction = build_study_instruction(st.session_state.study_subject, grounding_context)
     else:
-        # FIX: .get() with a General fallback so no mode can ever KeyError here
+        # .get() with a General fallback so no mode can ever KeyError here
         instruction = MODE_INSTRUCTIONS.get(st.session_state.mode, GENERAL_SYSTEM_INSTRUCTION)
     instruction = apply_personalization(instruction)
     model = genai.GenerativeModel(
@@ -1726,6 +1786,7 @@ def render_emoji_picker():
                     if cols[i % 6].button(e, key=f"emoji_{category}_{i}", use_container_width=True):
                         handle_turn([e], fallback_user_text=e)
 
+
 # ----------------------------------------------------------------------
 # Chat history
 # ----------------------------------------------------------------------
@@ -1796,7 +1857,7 @@ with col_mic:
     )
 
 with col_photo:
-    # FIX: the key includes a counter that is bumped after each send, so the
+    # The key includes a counter that is bumped after each send, so the
     # uploader (and caption box) reset instead of keeping the old photo attached.
     photo = st.file_uploader(
         "Attach a photo",
