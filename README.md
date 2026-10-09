@@ -1,103 +1,121 @@
 # 🧠 Cheat Mind
 
-An emotion-aware AI chatbot with live voice, built with **Streamlit** + **Gemini**.
+An emotion-aware AI study companion for WASSCE students in The Gambia. It listens, talks back, and reacts to how you feel.
 
-Talk to it (or type), and it replies with a natural response, speaks it back aloud, and shows an animated emoji face that reacts with the emotion it "felt" while replying.
+**🔗 Live app:** https://emotionaiagent-bah-2006.streamlit.app/
+
+> Despite the name, Cheat Mind is a **study and learning tool**. It helps students understand their subjects, practise exam questions and plan their revision. It is not a tool for cheating.
+
+![Cheat Mind concept illustration](assets/cheatmind-architecture.jpg)
+
+*Concept illustration of the idea: multimodal input (audio, text, video, uploads) goes into an emotion-aware AI engine, which produces a response. The real app flow is shown under [How it works](#how-it-works).*
 
 ---
+
+## Why I built it
+
+Thousands of students in The Gambia sit the WASSCE with no tutor, no study plan and nobody to ask when they get stuck. I built Cheat Mind so a student can study with an AI companion that explains, quizzes and encourages, in the languages they actually speak.
 
 ## Features
 
-- 💬 **Text chat** — normal chat input, full conversation history.
-- 🎤 **Live voice input** — record a voice clip with one click; it's sent straight to Gemini, which transcribes and understands it directly (no separate speech-to-text step).
-- 🔊 **Spoken replies** — toggle in the sidebar to have replies read aloud using your browser's built-in text-to-speech.
-- 🎭 **Animated emotion face** — a big emoji + color-coded panel at the top that changes based on the emotion Gemini reports with each reply (happy, curious, thinking, annoyed, etc.).
-- 😊 **Emoji picker** — a quick popover with categorized emoji (Smileys, Gestures, Hearts, Animals, Fun). Tap one to send it straight into the chat as a message.
-- 🔐 **No stored keys** — your Gemini API key is entered per-session in the sidebar and never written to disk.
+| Mode | What it does |
+|---|---|
+| 💙 **Comfort** | Emotionally supportive chat, with an optional calming tune or short story when the student seems low |
+| 💻 **Coding Help** | Direct, code-first programming answers |
+| 📚 **Study Help** | WASSCE tutoring in 12 subjects, with answer feedback and reference-grounded explanations (RAG) |
+| 📝 **Quiz** | AI-generated WASSCE-style multiple-choice quizzes, scored with explanations |
+| 📈 **Progress** | Accuracy per subject, score history and weak topics |
+| 🗓️ **Study Plan** | Exam countdown and a day-by-day plan built around weak topics |
+| 💰 **Sales & Business** | Practical advice for small business and side hustles |
+| ✍️ **Poetry Help** | Craft feedback to help students write their own poems |
+| 🤝 **Peer Help** | A shared class board where students post questions and reply to each other |
+| 🎬 **Video Studio** | Short AI video clips with Veo (uses the student's own paid Gemini key) |
+| 🌐 **General** | Anything else |
 
----
+**Also included:**
+- 🎙️ Voice input (the audio is sent straight to Gemini) and spoken replies
+- 📷 Photo input, such as a textbook page
+- 🌍 Reply languages: English, Wolof, Mandinka, Fula, Jola, Serer, Soninke, Jula and French
+- ⏱️ Study timer with optional Google Sheets session logging
+- 👍/👎 feedback on replies, logged for improvement
+- 🌙 Dark mode, and chat export/import
 
-## Setup
+## How it works
 
-1. **Install dependencies**
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-2. **Get a Gemini API key**
-
-   Free at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey).
-
-3. **Run the app**
-
-   ```bash
-   streamlit run cheat_mind_app.py
-   ```
-
-4. Paste your API key into the sidebar when the app opens in your browser.
-
----
-
-## Usage
-
-- **Type**: use the chat box at the bottom.
-- **Talk**: click **🎤 Start talking**, speak, click **⏹ Stop**. Your browser will ask for microphone permission the first time.
-- **Send an emoji**: click **😊 Emoji**, pick a category tab, tap an emoji — it's sent immediately as a message and Cheat Mind reacts to it.
-- **Hear replies**: leave **"Speak replies aloud"** checked in the sidebar (on by default). Adjust the speech rate slider to taste.
-- **Change model**: the sidebar lets you swap the Gemini model name if you want to try a different one.
-- **Clear chat**: sidebar button resets the conversation and emotion state.
-
----
-
-## Requirements
-
-- Python 3.9+
-- A Gemini API key
-- Microphone access in your browser (for voice input)
-- **HTTPS or `localhost`** — browsers block microphone access on plain HTTP over a network IP, so voice input only works when run locally or deployed behind HTTPS.
-
----
-
-## Troubleshooting
-
-**Mic button doesn't do anything / no permission prompt**
-Make sure you're on `localhost` or an HTTPS deployment, and that your browser has mic access enabled for the site.
-
-**"Something went wrong talking to Gemini" after a voice message**
-This is usually an audio-format mismatch. Run:
-
-```bash
-pip show streamlit-mic-recorder
+```mermaid
+flowchart TD
+    A[Student input: voice, text, photo, emoji] --> B[Mode selector: 11 modes]
+    B --> C[Chat modes]
+    B --> D[Learning tools: Quiz, Plan, Progress]
+    B --> E[Peer Help and Video Studio]
+    C --> F[Gemini + ChromaDB retrieval]
+    D --> G[Gemini + Google Sheets logs]
+    E --> H[Google Sheets board + Veo with own key]
+    F --> I[Reply screen: emotion face, text, voice, feedback]
+    G --> I
+    H --> I
 ```
 
-and check the version — older versions default to `wav`, newer ones may default to `webm`. The app auto-detects and maps this, but if it still fails, try pinning:
+Every chat reply comes back from Gemini as structured JSON (`transcript`, `reply`, `emotion`, `user_mood`). The app uses it to show the emotion face, speak the reply and decide when to gently offer a calming tune or story.
+
+## Tech stack
+
+- **App:** Python, Streamlit
+- **AI:** Google Gemini (chat, quizzes, plans), Veo (video)
+- **Retrieval:** ChromaDB with per-subject knowledge files
+- **Storage:** Google Sheets via `gspread` (class board, quiz log, feedback, study log)
+- **Voice:** `streamlit-mic-recorder` and the browser's built-in text-to-speech
+- **Hosting:** Streamlit Community Cloud
+
+## Run it locally
 
 ```bash
-pip install streamlit-mic-recorder==0.0.8
+git clone https://github.com/bahsulayman689-hash/emotion_ai_agent.git
+cd emotion_ai_agent
+pip install -r requirements.txt
+streamlit run cheat_mind_app.py
 ```
 
-**No sound when a reply comes back**
-Browser text-to-speech (`speechSynthesis`) sometimes needs a page interaction first — click anywhere on the page once, then try again. Voice quality/availability also depends on your OS (Windows, macOS, Android, etc. all ship different default voices).
+Get a free Gemini key at https://aistudio.google.com/app/apikey.
 
-**API key errors**
-Double check the key was copied fully and has no extra whitespace. Keys are session-only — refreshing the page clears it.
+### Keys and secrets
 
----
+Keys are never stored in the code. Create `.streamlit/secrets.toml` (already in `.gitignore`):
+
+```toml
+GEMINI_API_KEY = "your-key"
+
+# Optional: shared Google Sheets for Peer Help, quiz log and feedback
+GSHEET_URL = "https://docs.google.com/spreadsheets/d/XXXX/edit"
+GCP_SERVICE_ACCOUNT = '''
+{ paste the full service account JSON here }
+'''
+```
+
+On Streamlit Cloud, paste the same content in **Settings → Secrets**. If no key is set, the sidebar shows a box where a user can paste their own.
+
+For Google Sheets, create a service account, enable the Sheets and Drive APIs, and share your sheet with the service account's email as **Editor**.
 
 ## Project structure
 
 ```
-cheat_mind_app.py   # main Streamlit app
-requirements.txt    # Python dependencies
-README.md           # this file
+├── cheat_mind_app.py          # the whole app
+├── requirements.txt
+├── *_kb.jsonl                 # subject knowledge files for retrieval
+├── assets/
+│   └── cheatmind-architecture.jpg
+├── .streamlit/secrets.toml    # local keys (not committed)
+└── README.md
 ```
 
----
+## Notes
 
-## Roadmap ideas
+- Video Studio costs real money and always uses the student's own billed Gemini key, never the app's shared key.
+- Comfort mode is a small lift, not a replacement for talking to someone you trust or a professional.
 
-- Mobile/vertical layout for demo recordings
-- "Listening..." animation while recording
-- Persistent chat history across sessions
-- Custom TTS voice selection
+## Author
+
+**Sulayman Bah** · ML/DL engineer from The Gambia
+📧 bahsulayman689@gmail.com · 💼 [LinkedIn](https://linkedin.com/in/sulayman-bah-8a7096423) · 💻 [GitHub](https://github.com/bahsulayman689-hash)
+
+Feedback and ideas are welcome. Open an issue or send a message.
