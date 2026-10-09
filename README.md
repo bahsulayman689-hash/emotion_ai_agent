@@ -6,7 +6,7 @@ An emotion-aware AI study companion for WASSCE students in The Gambia. It listen
 
 > Despite the name, Cheat Mind is a **study and learning tool**. It helps students understand their subjects, practise exam questions and plan their revision. It is not a tool for cheating.
 
-![Cheat Mind concept illustration](assets/cheatmind-architecture.jpg)
+![Cheat Mind concept illustration](https://github.com/bahsulayman689-hash/emotion_ai_agent/blob/main/image_635e43d2.jpg)
 
 *Concept illustration of the idea: multimodal input (audio, text, video, uploads) goes into an emotion-aware AI engine, which produces a response. The real app flow is shown under [How it works](#how-it-works).*
 
