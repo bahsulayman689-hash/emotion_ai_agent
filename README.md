@@ -119,3 +119,6 @@ For Google Sheets, create a service account, enable the Sheets and Drive APIs, a
 📧 bahsulayman689@gmail.com · 💼 [LinkedIn](https://linkedin.com/in/sulayman-bah-8a7096423) · 💻 [GitHub](https://github.com/bahsulayman689-hash)
 
 Feedback and ideas are welcome. Open an issue or send a message.
+## License
+
+Released under the [MIT License](LICENSE). You are free to use, copy, modify and share this project, as long as the copyright notice stays.
